@@ -20,7 +20,7 @@ if errorlevel 1 (
 )
 echo Installing the app...
 "%ADB%" install -r "%ROOT%UniverseAtWar.apk" >> "%LOG%" 2>&1
-if errorlevel 1 (echo Install failed - Claude will read the log. & pause & exit /b 1)
+if errorlevel 1 (echo Install failed - see the logs folder. & pause & exit /b 1)
 REM Android only lets the app itself create its folder, so start it once and close it.
 "%ADB%" shell am start -n com.uaw.recomp/.UawActivity >> "%LOG%" 2>&1
 timeout /t 6 /nobreak >nul
@@ -34,7 +34,7 @@ if errorlevel 1 (
   tar -cf - Data default.xex | "%ADB%" exec-in tar -xf - -C %PKGDIR%/game >> "%LOG%" 2>&1
   popd
   "%ADB%" shell ls %PKGDIR%/game/default.xex >nul 2>&1
-  if errorlevel 1 (echo Copy failed - Claude will read the log. & pause & exit /b 1)
+  if errorlevel 1 (echo Copy failed - see the logs folder. & pause & exit /b 1)
   "%ADB%" shell du -sh %PKGDIR%/game >> "%LOG%" 2>&1
 ) else (
   echo Game files already on the phone.
@@ -48,5 +48,4 @@ echo Starting the game on the phone...
 echo ==== DONE >> "%LOG%"
 echo.
 echo The game should now be opening on your phone.
-echo When you're done (or if it closes/crashes), choose "Get Retroid logs" in the Start here menu so Claude can read what happened.
 pause

@@ -33,16 +33,15 @@ generated from the executable are excluded by `.gitignore` and must come from yo
 | `userdata/` | Save data / profile (not tracked) |
 | `logs/` | Build/run logs (not tracked) |
 
-## Launchers (double-click)
-| Script | Purpose |
+## How to use (double-click `Start here.bat`)
+| Option | What it does |
 |---|---|
-| `Start here.bat` | Menu with every action below (the action scripts are in `scripts/actions/`) |
-| 1 Play on PC | `pc_play.bat` (needs a PC build: `scripts/build_sdk_inner.bat`, then `scripts/game_inner.bat`) |
-| 2 Retroid: build, install and start | `android_build_app.bat` then `android_install_and_start.bat` (USB debugging on; copies game files the first time) |
-| 3 Retroid: test run | `android_test_run.bat`: build, install, play with profiler, collect logs (extra settings: `scripts/android_test_args.txt`, `scripts/android_test_env.txt`) |
-| 4 Retroid: get logs | `android_get_logs.bat`: game log + Android log into `logs/` |
-| 5 Save and upload | `save_progress.bat` (commit) then `upload_to_github.bat` (push) |
-| 6 First-time setup | `android_install_tools.bat`: Java 17, Android SDK + NDK into `android-tools/` |
+| 1 First-time setup | Downloads the ReXGlue SDK, applies `patches/`, builds it and the PC version (`scripts/build_sdk_inner.bat`, `scripts/game_inner.bat`; needs VS 2022 Build Tools, LLVM/Clang, CMake, Ninja, Git) |
+| 2 First-time setup | `android_install_tools.bat`: Java 17, Android SDK + NDK into `android-tools/` |
+| 3 Play on PC | `pc_play.bat` |
+| 4 Retroid: build, install and start | `android_build_app.bat` then `android_install_and_start.bat` (USB debugging on; copies the game files the first time) |
+
+Logs go to the `logs/` folder.
 
 Build machinery used by the actions: `scripts/android_build_inner.bat`, `scripts/apply_sdk_patches.bat`, `scripts/build_sdk_inner.bat`, `scripts/game_inner.bat`.
 
@@ -81,7 +80,7 @@ After any manifest change, codegen must report **0** "Unresolved …" / "Jump ta
 
 ## Android notes
 - SDK patches `patches/0002-android-port.patch` (platform port) and `0003-vulkan-storage-rewind.patch`
-  are applied automatically by the Android build (menu option 2 or 3).
+  are applied automatically by the Android build (menu option 4).
 - On the device everything lives in `Android/data/com.uaw.recomp/files/`: `game/` (Data + default.xex),
   `userdata/` (saves, shader cache), `uaw.log`, optional `args.txt` (extra flags, one per line).
 
