@@ -1,0 +1,57 @@
+From d31940de3481a8b7836b6388b4dcd8a599fda88a Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 24 Oct 2026 10:11:18 -0400
+Subject: [PATCH] ui_achievement_toasts switch (its always-registered overlay
+ forces UI-thread painting); log paint mode changes
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01JJM25S15YdvewrFFwP8g6Z
+---
+ src/ui/presenter.cpp | 5 +++++
+ src/ui/rex_app.cpp   | 7 ++++++-
+ 2 files changed, 11 insertions(+), 1 deletion(-)
+
+diff --git a/src/ui/presenter.cpp b/src/ui/presenter.cpp
+index 3537b6d..4ac290b 100644
+--- a/src/ui/presenter.cpp
++++ b/src/ui/presenter.cpp
+@@ -1301,6 +1301,11 @@ void Presenter::SetPaintModeFromUIThread(PaintMode new_mode) {
+   if (paint_mode_ == new_mode) {
+     return;
+   }
++  REXLOG_INFO("Presenter: paint mode {} ({} UI drawers, implicit vsync {})",
++              new_mode == PaintMode::kNone              ? "none"
++              : new_mode == PaintMode::kUIThreadOnRequest ? "UI thread"
++                                                          : "guest output thread",
++              ui_drawers_.size(), surface_paint_connection_has_implicit_vsync_);
+   {
+     std::lock_guard<std::mutex> lock(paint_mode_mutex_);
+     paint_mode_ = new_mode;
+diff --git a/src/ui/rex_app.cpp b/src/ui/rex_app.cpp
+index b94fe9e..718f1a5 100644
+--- a/src/ui/rex_app.cpp
++++ b/src/ui/rex_app.cpp
+@@ -51,6 +51,11 @@ REXCVAR_DEFINE_STRING(gpu_plugin, "", "GPU",
+                       "GPU emulation")
+     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+ 
++REXCVAR_DEFINE_BOOL(ui_achievement_toasts, true, "UI",
++                    "Show achievement pop-ups. The pop-up overlay stays registered while "
++                    "enabled, which makes every frame go through the UI thread (worse frame "
++                    "pacing on Android)");
++
+ namespace rex {
+ 
+ // --- ReXApp ---
+@@ -432,7 +437,7 @@ void ReXApp::LaunchModule() {
+     // Register the achievement notification callback now that the runtime and
+     // KernelState are guaranteed to exist. Done here (not OnCreateDialogs)
+     // because KernelState is null during SetupPresentation.
+-    if (!achievement_notification_) {
++    if (!achievement_notification_ && REXCVAR_GET(ui_achievement_toasts)) {
+       achievement_notification_ =
+           std::shared_ptr<ui::AchievementNotificationDialog>(CreateAchievementNotificationDialog());
+     }
+-- 
+2.43.0
+

@@ -1,0 +1,71 @@
+From 5be4e546736b897be217cfc4cb201100b29209d9 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 23 Oct 2026 21:54:26 -0400
+Subject: [PATCH] gpu_debug_fault_watch: read the fault count from a file the
+ test script writes
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01JJM25S15YdvewrFFwP8g6Z
+---
+ src/graphics/vulkan/command_processor.cpp | 31 +++++++++++++++++++++--
+ 1 file changed, 29 insertions(+), 2 deletions(-)
+
+diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
+index 42d3444..134256a 100644
+--- a/src/graphics/vulkan/command_processor.cpp
++++ b/src/graphics/vulkan/command_processor.cpp
+@@ -2384,6 +2384,9 @@ namespace {
+ // gpu_debug_fault_watch state (single command processor).
+ struct GpuFaultWatch {
+   int kmsg_fd = -2;
++  uint64_t file_count = 0;
++  uint64_t file_check_frame = 0;
++  bool frames_seen_file = false;
+   std::unordered_set<uint64_t> frame_keys;
+   std::deque<std::unordered_set<uint64_t>> recent_frames;
+   std::unordered_map<uint64_t, uint64_t> used_frames;
+@@ -2406,7 +2409,31 @@ uint32_t GpuFaultWatchReadFaults() {
+                 g_fault_watch.kmsg_fd >= 0 ? "ok" : "can't open /dev/kmsg");
+   }
+   if (g_fault_watch.kmsg_fd < 0) {
+-    return 0;
++    // Apps can't read the kernel log, so the test script counts GPU page
++    // faults with dmesg and writes the running total into this file.
++    if (g_fault_watch.frames < g_fault_watch.file_check_frame + 2) {
++      return 0;
++    }
++    g_fault_watch.file_check_frame = g_fault_watch.frames;
++    int fd = open("/data/local/tmp/rex_gpu_faults", O_RDONLY | O_CLOEXEC);
++    if (fd < 0) {
++      return 0;
++    }
++    char text[32] = {};
++    ssize_t n = read(fd, text, sizeof(text) - 1);
++    close(fd);
++    if (n <= 0) {
++      return 0;
++    }
++    uint64_t total = std::strtoull(text, nullptr, 10);
++    uint64_t delta = total > g_fault_watch.file_count ? total - g_fault_watch.file_count : 0;
++    if (!g_fault_watch.file_count && total && !g_fault_watch.frames_seen_file) {
++      // Faults from before this run.
++      delta = 0;
++    }
++    g_fault_watch.frames_seen_file = true;
++    g_fault_watch.file_count = total;
++    return uint32_t(delta);
+   }
+   uint32_t count = 0;
+   char record[2048];
+@@ -2447,7 +2474,7 @@ void VulkanCommandProcessor::GpuFaultWatchFrameEnd() {
+   }
+   w.recent_frames.push_back(std::move(w.frame_keys));
+   w.frame_keys = {};
+-  while (w.recent_frames.size() > 4) {
++  while (w.recent_frames.size() > 8) {
+     w.recent_frames.pop_front();
+   }
+   uint32_t new_faults = GpuFaultWatchReadFaults();
+-- 
+2.43.0
+

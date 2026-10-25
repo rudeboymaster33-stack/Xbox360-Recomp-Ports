@@ -1,0 +1,62 @@
+From 9ef5607a71d1c1f61f83496fd255de168a55607b Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 24 Oct 2026 19:53:07 -0400
+Subject: [PATCH] Android: handle going to the background in the SDL event
+ watch; smoother pacing defaults (25 ms)
+
+SDL blocks in the pump right after queueing the enter-background events, so
+the queued copies were never seen while backgrounded and the game kept running.
+Pacing latency / min lead back to 25 ms (8 ms restarted the cadence 30-44 times
+per 300 frames - visible judder when turning); the max-lead cap stays.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01JJM25S15YdvewrFFwP8g6Z
+---
+ src/ui/vulkan/vulkan_presenter.cpp  |  4 ++--
+ src/ui/windowed_app_context_sdl.cpp | 13 +++++++++++++
+ 2 files changed, 15 insertions(+), 2 deletions(-)
+
+diff --git a/src/ui/vulkan/vulkan_presenter.cpp b/src/ui/vulkan/vulkan_presenter.cpp
+index 76702bd..c70644c 100644
+--- a/src/ui/vulkan/vulkan_presenter.cpp
++++ b/src/ui/vulkan/vulkan_presenter.cpp
+@@ -57,10 +57,10 @@ REXCVAR_DEFINE_BOOL(vulkan_present_display_timing, true, "UI/Vulkan",
+ REXCVAR_DEFINE_BOOL(vulkan_present_pacing_max_lead, true, "UI/Vulkan",
+                     "Paced presentation: never schedule a frame more than one refresh past "
+                     "the target lead (lower input-to-screen latency)");
+-REXCVAR_DEFINE_INT32(vulkan_present_pacing_latency_ms, 8, "UI/Vulkan",
++REXCVAR_DEFINE_INT32(vulkan_present_pacing_latency_ms, 25, "UI/Vulkan",
+                      "Paced presentation: how far ahead (ms) a frame is scheduled when the even "
+                      "cadence (re)starts - headroom that absorbs frames arriving a little late");
+-REXCVAR_DEFINE_INT32(vulkan_present_pacing_min_lead_ms, 8, "UI/Vulkan",
++REXCVAR_DEFINE_INT32(vulkan_present_pacing_min_lead_ms, 25, "UI/Vulkan",
+                      "Paced presentation: a frame keeps its place in the cadence as long as it "
+                      "arrives at least this many ms before its scheduled time");
+ REXCVAR_DEFINE_BOOL(vulkan_present_pacing_median, true, "Vulkan",
+diff --git a/src/ui/windowed_app_context_sdl.cpp b/src/ui/windowed_app_context_sdl.cpp
+index 9060d26..46dba33 100644
+--- a/src/ui/windowed_app_context_sdl.cpp
++++ b/src/ui/windowed_app_context_sdl.cpp
+@@ -230,6 +230,19 @@ bool SDLCALL SDLWindowedAppContext::WatchEvent(void* userdata, SDL_Event* event)
+     ++context->synchronously_handled_quit_events_;
+     context->ProcessQuitRequest();
+   }
++#if REX_PLATFORM_ANDROID
++  // SDL on Android blocks inside the event pump right after queueing the
++  // enter-background events, so the queued copies are only seen after the app
++  // returns. Handle going to the background here, while SDL sends the event on
++  // the UI thread, so the presenter lets go of the surface and the game pauses.
++  if ((event->type == SDL_EVENT_WILL_ENTER_BACKGROUND ||
++       event->type == SDL_EVENT_DID_ENTER_BACKGROUND) &&
++      context->IsInUIThread()) {
++    for (auto& [id, window] : context->windows_) {
++      window->HandleAppLifecycle(false);
++    }
++  }
++#endif
+   return true;
+ }
+ 
+-- 
+2.43.0
+

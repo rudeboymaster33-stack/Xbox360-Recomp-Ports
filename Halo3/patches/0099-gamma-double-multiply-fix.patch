@@ -1,0 +1,118 @@
+From 43905e14308217cd10b803163ef5c587b6c478a1 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 24 Oct 2026 11:15:49 -0400
+Subject: [PATCH] Gamma render targets in the shader-conversion path: convert
+ double-multiply blended color 0 as PWL(2c)/2 so 0.5 stays neutral (Halo 3
+ decal boxes)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01JJM25S15YdvewrFFwP8g6Z
+---
+ .../pipeline/shader/spirv_translator.h        |  7 +++++
+ .../pipeline/shader/spirv_translator_rb.cpp   | 31 ++++++++++++++++++-
+ src/graphics/vulkan/command_processor.cpp     | 15 +++++++++
+ 3 files changed, 52 insertions(+), 1 deletion(-)
+
+diff --git a/include/rex/graphics/pipeline/shader/spirv_translator.h b/include/rex/graphics/pipeline/shader/spirv_translator.h
+index b6a89da..5e4548f 100644
+--- a/include/rex/graphics/pipeline/shader/spirv_translator.h
++++ b/include/rex/graphics/pipeline/shader/spirv_translator.h
+@@ -152,6 +152,11 @@ class SpirvShaderTranslator : public ShaderTranslator {
+     // taking into account the potential relation with occlusion queries (but
+     // should be safe at least temporarily).
+     kSysFlag_FSIDepthStencilEarlyWrite_Shift,
++    // Host render target path with gamma conversion in the shader, color
++    // target 0 blended as "double multiply" (src * dst + dst * src): convert as
++    // PWL(2 * color) / 2 so 0.5 stays neutral and the result is close to
++    // blending in linear space (the Xbox 360 blends gamma targets linearly).
++    kSysFlag_ConvertColor0ToGammaDoubleMultiply_Shift,
+ 
+     kSysFlag_Count,
+ 
+@@ -200,6 +205,8 @@ class SpirvShaderTranslator : public ShaderTranslator {
+     kSysFlag_FSIDepthWrite = 1u << kSysFlag_FSIDepthWrite_Shift,
+     kSysFlag_FSIStencilTest = 1u << kSysFlag_FSIStencilTest_Shift,
+     kSysFlag_FSIDepthStencilEarlyWrite = 1u << kSysFlag_FSIDepthStencilEarlyWrite_Shift,
++    kSysFlag_ConvertColor0ToGammaDoubleMultiply =
++        1u << kSysFlag_ConvertColor0ToGammaDoubleMultiply_Shift,
+   };
+   static_assert(kSysFlag_Count <= 32, "Too many flags in the system constants");
+ 
+diff --git a/src/graphics/pipeline/shader/spirv_translator_rb.cpp b/src/graphics/pipeline/shader/spirv_translator_rb.cpp
+index 5e9019b..dbf8741 100644
+--- a/src/graphics/pipeline/shader/spirv_translator_rb.cpp
++++ b/src/graphics/pipeline/shader/spirv_translator_rb.cpp
+@@ -1396,7 +1396,36 @@ void SpirvShaderTranslator::CompleteFragmentShaderInMain() {
+                 builder_->makeUintConstant(kSysFlag_ConvertColor0ToGamma << color_target_index)),
+             const_uint_0_);
+         SpirvBuilder::IfBuilder if_gamma(is_gamma, spv::SelectionControlDontFlattenMask, *builder_);
+-        spv::Id color_rgb_gamma = LinearToPWLGamma(color_rgb, false);
++        spv::Id color_rgb_gamma;
++        if (color_target_index == 0) {
++          spv::Id is_double_multiply = builder_->createBinOp(
++              spv::OpINotEqual, type_bool_,
++              builder_->createBinOp(
++                  spv::OpBitwiseAnd, type_uint_, main_system_constant_flags_,
++                  builder_->makeUintConstant(kSysFlag_ConvertColor0ToGammaDoubleMultiply)),
++              const_uint_0_);
++          id_vector_temp_.clear();
++          id_vector_temp_.resize(3, is_double_multiply);
++          spv::Id is_double_multiply_vec = builder_->createCompositeConstruct(
++              builder_->makeVectorType(type_bool_, 3), id_vector_temp_);
++          id_vector_temp_.clear();
++          id_vector_temp_.resize(3, builder_->makeFloatConstant(2.0f));
++          spv::Id const_float3_2 = builder_->makeCompositeConstant(type_float3_, id_vector_temp_);
++          id_vector_temp_.clear();
++          id_vector_temp_.resize(3, builder_->makeFloatConstant(0.5f));
++          spv::Id const_float3_half = builder_->makeCompositeConstant(type_float3_, id_vector_temp_);
++          spv::Id color_rgb_doubled = builder_->createBinOp(spv::OpFMul, type_float3_, color_rgb,
++                                                            const_float3_2);
++          spv::Id color_rgb_to_convert = builder_->createTriOp(
++              spv::OpSelect, type_float3_, is_double_multiply_vec, color_rgb_doubled, color_rgb);
++          spv::Id converted = LinearToPWLGamma(color_rgb_to_convert, false);
++          color_rgb_gamma = builder_->createTriOp(
++              spv::OpSelect, type_float3_, is_double_multiply_vec,
++              builder_->createBinOp(spv::OpFMul, type_float3_, converted, const_float3_half),
++              converted);
++        } else {
++          color_rgb_gamma = LinearToPWLGamma(color_rgb, false);
++        }
+         if_gamma.makeEndIf();
+         color_rgb = if_gamma.createMergePhi(color_rgb_gamma, color_rgb);
+         {
+diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
+index 2505190..52f4265 100644
+--- a/src/graphics/vulkan/command_processor.cpp
++++ b/src/graphics/vulkan/command_processor.cpp
+@@ -127,6 +127,9 @@ REXCVAR_DEFINE_BOOL(gpu_debug_fault_watch, false, "GPU",
+ REXCVAR_DEFINE_BOOL(gpu_frame_trace, true, "GPU",
+                     "With vulkan_gpu_timestamps, also write the detailed [gpu-dt] trace of one "
+                     "frame every 120 frames (very verbose)");
++REXCVAR_DEFINE_BOOL(gpu_gamma_double_multiply_fix, true, "GPU",
++                    "With gamma render targets converted in shaders, convert \"double "
++                    "multiply\" blended colors so 0.5 stays neutral (Halo 3 decal boxes)");
+ REXCVAR_DEFINE_BOOL(gpu_frame_trace_draws, false, "GPU",
+                     "With the [gpu-dt] frame trace, also log every draw with its shaders, blend "
+                     "and render target state, and textures (format, size, clamp, border)");
+@@ -7390,6 +7393,18 @@ void VulkanCommandProcessor::UpdateSystemConstantValues(
+         flags |= SpirvShaderTranslator::kSysFlag_ConvertColor0ToGamma << i;
+       }
+     }
++    // "Double multiply" blending (decals in 4D5307E6) into a gamma target 0:
++    // blending happens in gamma space here, which turns the neutral 0.5 into a
++    // brightening - convert the color as PWL(2 * c) / 2 instead.
++    if (REXCVAR_GET(gpu_gamma_double_multiply_fix) &&
++        color_infos[0].color_format == xenos::ColorRenderTargetFormat::k_8_8_8_8_GAMMA) {
++      auto blend0 = regs.Get<reg::RB_BLENDCONTROL>(reg::RB_BLENDCONTROL::rt_register_indices[0]);
++      if (blend0.color_srcblend == xenos::BlendFactor::kDstColor &&
++          blend0.color_destblend == xenos::BlendFactor::kSrcColor &&
++          blend0.color_comb_fcn == xenos::BlendOp::kAdd) {
++        flags |= SpirvShaderTranslator::kSysFlag_ConvertColor0ToGammaDoubleMultiply;
++      }
++    }
+   }
+   if (edram_fragment_shader_interlock && depth_stencil_enabled) {
+     flags |= SpirvShaderTranslator::kSysFlag_FSIDepthStencil;
+-- 
+2.43.0
+

@@ -1,2 +1,0 @@
-#wait=65
---gpu_shader_allow_fma=true

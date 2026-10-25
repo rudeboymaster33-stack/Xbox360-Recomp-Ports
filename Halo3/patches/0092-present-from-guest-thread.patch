@@ -1,0 +1,40 @@
+From a706072654453b4ae34d3b3db62ac6a5f4986432 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 24 Oct 2026 10:06:11 -0400
+Subject: [PATCH] Present from the guest output thread even with vsync
+ (host_present_from_guest_thread_with_vsync)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01JJM25S15YdvewrFFwP8g6Z
+---
+ src/ui/presenter.cpp | 7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/src/ui/presenter.cpp b/src/ui/presenter.cpp
+index 7559259..3537b6d 100644
+--- a/src/ui/presenter.cpp
++++ b/src/ui/presenter.cpp
+@@ -29,6 +29,10 @@
+ REXCVAR_DEFINE_BOOL(host_present_from_non_ui_thread, true, "UI/Presenter",
+                     "Allow presentation from non-UI thread");
+ 
++REXCVAR_DEFINE_BOOL(host_present_from_guest_thread_with_vsync, true, "UI/Presenter",
++                    "Present each guest frame from the guest output thread even when the host "
++                    "presentation waits for vertical sync (paced presentation shows every frame "
++                    "exactly once instead of the UI thread dropping frames it can't keep up with)");
+ REXCVAR_DEFINE_BOOL(present_letterbox, true, "UI/Presenter",
+                     "Enable letterboxing for non-native aspect ratios");
+ 
+@@ -1314,7 +1318,8 @@ Presenter::PaintMode Presenter::GetDesiredPaintModeFromUIThread(bool is_paintabl
+   if (!REXCVAR_GET(host_present_from_non_ui_thread)) {
+     return PaintMode::kUIThreadOnRequest;
+   }
+-  if (surface_paint_connection_has_implicit_vsync_) {
++  if (surface_paint_connection_has_implicit_vsync_ &&
++      !REXCVAR_GET(host_present_from_guest_thread_with_vsync)) {
+     // Don't be causing host vertical sync CPU waits in the thread generating
+     // the guest output.
+     return PaintMode::kUIThreadOnRequest;
+-- 
+2.43.0
+

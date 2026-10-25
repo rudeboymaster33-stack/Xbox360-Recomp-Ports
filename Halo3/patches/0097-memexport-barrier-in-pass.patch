@@ -1,0 +1,278 @@
+From 9781c16ae5e3d632a597ffa1e963e071a9b14843 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 24 Oct 2026 10:44:13 -0400
+Subject: [PATCH] vulkan_memexport_barrier_in_pass: keep the render pass open
+ across vertex-shader memexport barriers (render pass self-dependency) - GPU
+ particles split passes ~100x per frame on Adreno
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01JJM25S15YdvewrFFwP8g6Z
+---
+ .../rex/graphics/vulkan/command_processor.h   |  6 +++
+ include/rex/graphics/vulkan/shared_memory.h   | 12 ++++++
+ src/graphics/vulkan/command_processor.cpp     | 42 ++++++++++++++++++-
+ src/graphics/vulkan/gpu_frame_stats.h         |  1 +
+ src/graphics/vulkan/render_target_cache.cpp   | 26 ++++++++++--
+ src/graphics/vulkan/shared_memory.cpp         | 19 +++++++++
+ 6 files changed, 101 insertions(+), 5 deletions(-)
+
+diff --git a/include/rex/graphics/vulkan/command_processor.h b/include/rex/graphics/vulkan/command_processor.h
+index 65a7b89..e2c0d8b 100644
+--- a/include/rex/graphics/vulkan/command_processor.h
++++ b/include/rex/graphics/vulkan/command_processor.h
+@@ -204,6 +204,11 @@ class VulkanCommandProcessor : public CommandProcessor {
+   // including adding pipeline barriers that are not a part of the render pass
+   // scope. Submission must be open.
+   void EndRenderPass();
++  // Records a vertex shader write -> shader read memory barrier inside the
++  // open guest draw render pass if it allows that (render pass objects with a
++  // self-dependency, vulkan_memexport_barrier_in_pass). False if the caller
++  // has to end the pass instead.
++  bool InPassVertexShaderMemoryBarrier();
+   // GPU timestamp profiling: attribute the following outside-of-pass work to
+   // resolves (1), texture loads (2) or back to generic outside work (0).
+   void GpuTsMarkOutsideKind(uint32_t kind);
+@@ -810,6 +815,7 @@ class VulkanCommandProcessor : public CommandProcessor {
+   VkRenderPass current_render_pass_;
+   const VulkanRenderTargetCache::Framebuffer* current_framebuffer_;
+   bool in_render_pass_ = false;
++  bool pass_allows_vertex_barrier_ = false;
+   // Render area tightening for tile-based GPUs: guest draws record their
+   // scissor; when the pass ends, the recorded begin-rendering render area is
+   // shrunk to the union, so the GPU loads/stores only that part.
+diff --git a/include/rex/graphics/vulkan/shared_memory.h b/include/rex/graphics/vulkan/shared_memory.h
+index e1e4ea5..df8c6ed 100644
+--- a/include/rex/graphics/vulkan/shared_memory.h
++++ b/include/rex/graphics/vulkan/shared_memory.h
+@@ -46,6 +46,15 @@ class VulkanSharedMemory : public SharedMemory {
+   // Inserts a pipeline barrier for the target usage, also ensuring consecutive
+   // read-write accesses are ordered with each other.
+   void Use(Usage usage, std::pair<uint32_t, uint32_t> written_range = {});
++  // Describes the guest draw about to call Use: whether its memory exports come
++  // from the pixel shader, and the shared memory range it reads as an index
++  // buffer (both block keeping the render pass open across a memexport
++  // barrier).
++  void SetDrawMemexportInfo(bool pixel_shader_writes, uint32_t index_read_start,
++                            uint32_t index_read_length) {
++    draw_pixel_shader_writes_ = pixel_shader_writes;
++    draw_index_read_ = std::make_pair(index_read_start, index_read_length);
++  }
+ 
+   VkBuffer buffer() const { return buffer_; }
+ 
+@@ -82,6 +91,9 @@ class VulkanSharedMemory : public SharedMemory {
+ 
+   Usage last_usage_;
+   std::pair<uint32_t, uint32_t> last_written_range_;
++  bool draw_pixel_shader_writes_ = false;
++  std::pair<uint32_t, uint32_t> draw_index_read_{0, 0};
++  bool last_write_from_pixel_shader_ = true;
+ 
+   std::unique_ptr<ui::vulkan::VulkanUploadBufferPool> upload_buffer_pool_;
+   std::vector<VkBufferCopy> upload_regions_;
+diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
+index f0da6ac..f907a27 100644
+--- a/src/graphics/vulkan/command_processor.cpp
++++ b/src/graphics/vulkan/command_processor.cpp
+@@ -72,6 +72,10 @@ REXCVAR_DEFINE_BOOL(vulkan_submit_on_primary_buffer_end, true, "GPU/Vulkan",
+                     "Submit command buffer when PM4 primary buffer ends")
+     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+ 
++REXCVAR_DEFINE_BOOL(vulkan_memexport_barrier_in_pass, false, "GPU/Vulkan",
++                    "Keep the render pass open across barriers for memory exported by vertex "
++                    "shaders (GPU particles) using render pass self-dependencies; needs "
++                    "--vulkan_dynamic_rendering=false");
+ REXCVAR_DEFINE_BOOL(vulkan_dynamic_rendering, true, "GPU/Vulkan",
+                     "Use VK_KHR_dynamic_rendering for Vulkan GPU emulation when supported by the "
+                     "device (falls back to render passes otherwise)")
+@@ -2664,9 +2668,9 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
+       }
+       REXGPU_INFO(
+           "[gpu-hoist] per frame: uploads_moved_before_pass={:.1f} uploads_kept={:.1f} "
+-          "shm_barriers_in_pass={:.1f} memexport_barriers_deferred={:.1f}",
++          "shm_barriers_in_pass={:.1f} memexport_barriers_deferred={:.1f} memexport_barriers_kept_in_pass={:.1f}",
+           st.shm_hoisted / f, st.shm_hoist_blocked / f, st.shm_use_barriers_in_pass / f,
+-          st.shm_memexport_deferred / f);
++          st.shm_memexport_deferred / f, st.shm_memexport_in_pass_barriers / f);
+       REXGPU_INFO(
+           "[gpu-query] per frame: queries={:.1f} draws_in_queries={:.1f} skipped={:.1f} "
+           "kept_zwrite={:.1f} kept_color={:.1f} kept_other={:.1f}",
+@@ -3554,6 +3558,9 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
+ 
+   current_render_pass_ = use_dynamic_rendering ? VK_NULL_HANDLE : render_pass;
+   current_framebuffer_ = framebuffer;
++  pass_allows_vertex_barrier_ =
++      !use_dynamic_rendering && REXCVAR_GET(vulkan_memexport_barrier_in_pass) &&
++      render_target_cache_->last_update_render_pass_key().depth_and_color_used != 0;
+   GpuTsMark(kGpuSegDrawPass |
+             GpuTsExtentTag(framebuffer->host_extent,
+                            render_target_cache_->last_update_render_pass_key().key));
+@@ -3688,6 +3695,7 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
+ 
+   current_render_pass_ = use_dynamic_rendering ? VK_NULL_HANDLE : render_pass;
+   current_framebuffer_ = framebuffer;
++  pass_allows_vertex_barrier_ = false;
+   gpu_ts_cur_slot_ = 0;
+   hoist_point_valid_ = false;
+   GpuTsMark(kGpuSegTransferPass);
+@@ -4178,8 +4186,26 @@ void VulkanCommandProcessor::LogPassBreakPushers(double frames) {
+   std::fill(std::begin(break_pusher_image_), std::end(break_pusher_image_), 0u);
+ }
+ 
++bool VulkanCommandProcessor::InPassVertexShaderMemoryBarrier() {
++  if (!in_render_pass_ || !pass_allows_vertex_barrier_ ||
++      current_render_pass_ == VK_NULL_HANDLE) {
++    return false;
++  }
++  VkMemoryBarrier memory_barrier;
++  memory_barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
++  memory_barrier.pNext = nullptr;
++  memory_barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
++  memory_barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
++  deferred_command_buffer_.CmdVkPipelineBarrier(
++      VK_PIPELINE_STAGE_VERTEX_SHADER_BIT,
++      guest_shader_pipeline_stages_ & ~VkPipelineStageFlags(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT),
++      0, 1, &memory_barrier, 0, nullptr, 0, nullptr);
++  return true;
++}
++
+ void VulkanCommandProcessor::EndRenderPass() {
+   assert_true(submission_open_);
++  pass_allows_vertex_barrier_ = false;
+   if (!in_render_pass_) {
+     return;
+   }
+@@ -5207,6 +5233,18 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+   // TODO(Triang3l): Find some PM4 command that can be used for indication of
+   // when memexports should be awaited instead of inserting the barrier in Use
+   // every time if memory export was done in the previous draw?
++  shared_memory_->SetDrawMemexportInfo(
++      memexport_used_pixel,
++      primitive_processing_result.index_buffer_type ==
++              PrimitiveProcessor::ProcessedIndexBufferType::kGuestDMA
++          ? primitive_processing_result.guest_index_base
++          : 0,
++      primitive_processing_result.index_buffer_type ==
++              PrimitiveProcessor::ProcessedIndexBufferType::kGuestDMA
++          ? primitive_processing_result.host_draw_vertex_count *
++                (primitive_processing_result.host_index_format == xenos::IndexFormat::kInt16 ? 2
++                                                                                            : 4)
++          : 0);
+   if (memexport_extent_start < memexport_extent_end) {
+     shared_memory_->Use(
+         VulkanSharedMemory::Usage::kGuestDrawReadWrite,
+diff --git a/src/graphics/vulkan/gpu_frame_stats.h b/src/graphics/vulkan/gpu_frame_stats.h
+index b9fb80f..1aeb547 100644
+--- a/src/graphics/vulkan/gpu_frame_stats.h
++++ b/src/graphics/vulkan/gpu_frame_stats.h
+@@ -32,6 +32,7 @@ struct GpuFrameStats {
+   uint64_t shm_hoisted = 0;        // uploads moved to before the render pass
+   uint64_t shm_hoist_blocked = 0;
+   uint64_t shm_use_barriers_in_pass = 0;   // shared memory barriers while a draw pass is open
++  uint64_t shm_memexport_in_pass_barriers = 0;  // memexport barriers kept inside the pass
+   uint64_t shm_memexport_deferred = 0;     // memexport barriers deferred (no overlapping read)  // uploads in a draw pass that could not be moved
+   uint64_t queries = 0;              // guest occlusion queries begun
+   uint64_t query_draws = 0;          // draws issued while a guest query was open
+diff --git a/src/graphics/vulkan/render_target_cache.cpp b/src/graphics/vulkan/render_target_cache.cpp
+index dad9e1b..b9cd2e3 100644
+--- a/src/graphics/vulkan/render_target_cache.cpp
++++ b/src/graphics/vulkan/render_target_cache.cpp
+@@ -70,6 +70,8 @@ REXCVAR_DEFINE_BOOL(gpu_debug_transfer_no_draw, false, "GPU",
+ REXCVAR_DEFINE_BOOL(gpu_debug_skip_all_transfers, false, "GPU",
+                     "Diagnostic only (breaks visuals): skip all EDRAM ownership transfers");
+ 
++REXCVAR_DECLARE(bool, vulkan_memexport_barrier_in_pass);
++
+ namespace rex::graphics::vulkan {
+ 
+ // Set by the command processor while a [gpu-dt] frame trace is active.
+@@ -1666,7 +1668,8 @@ VkRenderPass VulkanRenderTargetCache::GetHostRenderTargetsRenderPass(RenderPassK
+     dependency_stage_mask |= VulkanRenderTarget::kColorDrawStageMask;
+     dependency_access_mask |= VulkanRenderTarget::kColorDrawAccessMask;
+   }
+-  VkSubpassDependency subpass_dependencies[2];
++  VkSubpassDependency subpass_dependencies[3];
++  uint32_t subpass_dependency_count = 2;
+   subpass_dependencies[0].srcSubpass = VK_SUBPASS_EXTERNAL;
+   subpass_dependencies[0].dstSubpass = 0;
+   subpass_dependencies[0].srcStageMask = dependency_stage_mask;
+@@ -1681,6 +1684,24 @@ VkRenderPass VulkanRenderTargetCache::GetHostRenderTargetsRenderPass(RenderPassK
+   subpass_dependencies[1].srcAccessMask = dependency_access_mask;
+   subpass_dependencies[1].dstAccessMask = dependency_access_mask;
+   subpass_dependencies[1].dependencyFlags = VK_DEPENDENCY_BY_REGION_BIT;
++  if (REXCVAR_GET(vulkan_memexport_barrier_in_pass)) {
++    // Self-dependency for vertex shader memory exports read by later draws in
++    // the same pass (VulkanCommandProcessor::InPassVertexShaderMemoryBarrier).
++    VkPipelineStageFlags guest_stages =
++        VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
++    if (command_processor_.GetVulkanDevice()->properties().tessellationShader) {
++      guest_stages |= VK_PIPELINE_STAGE_TESSELLATION_CONTROL_SHADER_BIT |
++                      VK_PIPELINE_STAGE_TESSELLATION_EVALUATION_SHADER_BIT;
++    }
++    VkSubpassDependency& self_dependency = subpass_dependencies[subpass_dependency_count++];
++    self_dependency.srcSubpass = 0;
++    self_dependency.dstSubpass = 0;
++    self_dependency.srcStageMask = VK_PIPELINE_STAGE_VERTEX_SHADER_BIT;
++    self_dependency.dstStageMask = guest_stages;
++    self_dependency.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
++    self_dependency.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
++    self_dependency.dependencyFlags = 0;
++  }
+ 
+   VkRenderPassCreateInfo render_pass_create_info;
+   render_pass_create_info.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
+@@ -1690,8 +1711,7 @@ VkRenderPass VulkanRenderTargetCache::GetHostRenderTargetsRenderPass(RenderPassK
+   render_pass_create_info.pAttachments = attachments;
+   render_pass_create_info.subpassCount = 1;
+   render_pass_create_info.pSubpasses = &subpass;
+-  render_pass_create_info.dependencyCount =
+-      key.depth_and_color_used ? uint32_t(rex::countof(subpass_dependencies)) : 0;
++  render_pass_create_info.dependencyCount = key.depth_and_color_used ? subpass_dependency_count : 0;
+   render_pass_create_info.pDependencies = subpass_dependencies;
+ 
+   const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
+diff --git a/src/graphics/vulkan/shared_memory.cpp b/src/graphics/vulkan/shared_memory.cpp
+index 7f4d962..dfcd3ef 100644
+--- a/src/graphics/vulkan/shared_memory.cpp
++++ b/src/graphics/vulkan/shared_memory.cpp
+@@ -231,11 +231,29 @@ void VulkanSharedMemory::Use(Usage usage, std::pair<uint32_t, uint32_t> written_
+       uint32_t end = std::max(last_written_range_.first + last_written_range_.second,
+                               written_range.first + written_range.second);
+       last_written_range_ = std::make_pair(start, end - start);
++      last_write_from_pixel_shader_ |= draw_pixel_shader_writes_;
+     }
+     ++GetGpuFrameStats().shm_memexport_deferred;
+     return;
+   }
+   if (last_usage_ != usage || last_written_range_.second) {
++    // Memory exported by an earlier vertex shader in this pass, read by this
++    // draw's shaders (not as its index buffer): a pipeline barrier inside the
++    // render pass is enough - ending and restarting the pass costs a store
++    // and reload of the whole framebuffer on tile-based GPUs.
++    if (in_draw_pass && last_usage_ == Usage::kGuestDrawReadWrite &&
++        (usage == Usage::kRead || usage == Usage::kGuestDrawReadWrite) &&
++        !last_write_from_pixel_shader_ && !draw_pixel_shader_writes_ &&
++        (!draw_index_read_.second || !last_written_range_.second ||
++         draw_index_read_.first + draw_index_read_.second <= last_written_range_.first ||
++         last_written_range_.first + last_written_range_.second <= draw_index_read_.first) &&
++        command_processor_.InPassVertexShaderMemoryBarrier()) {
++      ++GetGpuFrameStats().shm_memexport_in_pass_barriers;
++      last_usage_ = usage;
++      last_written_range_ = written_range;
++      last_write_from_pixel_shader_ = written_range.second ? draw_pixel_shader_writes_ : false;
++      return;
++    }
+     if (in_draw_pass) {
+       ++GetGpuFrameStats().shm_use_barriers_in_pass;
+     }
+@@ -262,6 +280,7 @@ void VulkanSharedMemory::Use(Usage usage, std::pair<uint32_t, uint32_t> written_
+         VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, false);
+   }
+   last_written_range_ = written_range;
++  last_write_from_pixel_shader_ = written_range.second ? draw_pixel_shader_writes_ : false;
+ }
+ 
+ bool VulkanSharedMemory::AllocateSparseHostGpuMemoryRange(uint32_t offset_allocations,
+-- 
+2.43.0
+

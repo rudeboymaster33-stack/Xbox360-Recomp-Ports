@@ -18,7 +18,7 @@ if errorlevel 1 (
 if not exist "%GAME%\default.xex" (echo Game files not unpacked yet - run menu option 1 first. & pause & exit /b 1)
 echo Installing the app...
 "%ADB%" install -r "%ROOT%Halo3.apk" >> "%LOG%" 2>&1
-if errorlevel 1 (echo Install failed - tell Claude. & pause & exit /b 1)
+if errorlevel 1 (echo Install failed - see the logs folder. & pause & exit /b 1)
 REM Android only lets the app itself create its folder, so start it once and close it.
 "%ADB%" shell am start -n %PKG%/.Halo3Activity >> "%LOG%" 2>&1
 timeout /t 6 /nobreak >nul
@@ -31,7 +31,7 @@ if errorlevel 1 (
   tar -cf - --exclude "$SystemUpdate" . | "%ADB%" exec-in tar -xf - -C %PKGDIR%/game >> "%LOG%" 2>&1
   popd
   "%ADB%" shell ls %PKGDIR%/game/default.xex >nul 2>&1
-  if errorlevel 1 (echo Copy failed - tell Claude. & pause & exit /b 1)
+  if errorlevel 1 (echo Copy failed - see the logs folder. & pause & exit /b 1)
   "%ADB%" shell du -sh %PKGDIR%/game >> "%LOG%" 2>&1
 ) else (
   echo Game files already on the Retroid.
@@ -43,5 +43,4 @@ echo Starting the game on the Retroid...
 echo ==== DONE >> "%LOG%"
 echo.
 echo The game should now be opening on your Retroid.
-echo When you're done (or if it closes or crashes), choose "Get Retroid logs" in the menu.
 pause

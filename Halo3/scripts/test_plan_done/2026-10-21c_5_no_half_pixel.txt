@@ -1,2 +1,0 @@
-#wait=60
---half_pixel_offset=false

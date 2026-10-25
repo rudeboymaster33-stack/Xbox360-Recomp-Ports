@@ -1,2 +1,0 @@
-#wait=70
-#profile=15

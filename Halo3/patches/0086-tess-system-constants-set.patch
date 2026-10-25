@@ -1,0 +1,34 @@
+From caf241b04a4bc0a0aa423b391cd73936cd7fcedf Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 23 Oct 2026 22:53:51 -0400
+Subject: [PATCH] Vulkan tessellation: read system constants from the constants
+ descriptor set, not set 0 (shared memory) - fixes invisible tessellated
+ geometry (Halo 3 water) and GPU page faults on Adreno
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01JJM25S15YdvewrFFwP8g6Z
+---
+ src/graphics/vulkan/pipeline_cache.cpp | 7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/src/graphics/vulkan/pipeline_cache.cpp b/src/graphics/vulkan/pipeline_cache.cpp
+index 7dd7ffe..b9a3e6f 100644
+--- a/src/graphics/vulkan/pipeline_cache.cpp
++++ b/src/graphics/vulkan/pipeline_cache.cpp
+@@ -118,7 +118,12 @@ constexpr bool IsPatchIndexedHostVertexShaderType(
+ 
+ std::string GetTessellationSystemConstantsBlockGlsl() {
+   std::string source;
+-  source += "layout(set = 0, binding = 0, std140) uniform XeSystemConstants {\n";
++  // Must match where the translated guest shaders take the system constants
++  // from - set 0 is the shared memory and EDRAM storage buffers.
++  source += fmt::format(
++      "layout(set = {}, binding = {}, std140) uniform XeSystemConstants {{\n",
++      uint32_t(SpirvShaderTranslator::kDescriptorSetConstants),
++      uint32_t(SpirvShaderTranslator::kConstantBufferSystem));
+   source += fmt::format("  layout(offset = {}) uint xe_vertex_index_endian;\n",
+                         offsetof(SpirvShaderTranslator::SystemConstants, vertex_index_endian));
+   source += fmt::format("  layout(offset = {}) int xe_vertex_base_index;\n",
+-- 
+2.43.0
+

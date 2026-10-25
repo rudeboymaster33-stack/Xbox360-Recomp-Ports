@@ -1,0 +1,148 @@
+From 13f48be3b47fc5d5a669f8add20abf21a7c2d8e2 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 22 Oct 2026 21:56:53 -0400
+Subject: [PATCH] vulkan: pipeline live/preload limits count only heavy
+ pipelines (guest loops -> ~24 MB Adreno scratch memory each; others take ~0)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01JJM25S15YdvewrFFwP8g6Z
+---
+ include/rex/graphics/vulkan/pipeline_cache.h |  7 ++-
+ src/graphics/vulkan/pipeline_cache.cpp       | 46 +++++++++++++++-----
+ 2 files changed, 41 insertions(+), 12 deletions(-)
+
+diff --git a/include/rex/graphics/vulkan/pipeline_cache.h b/include/rex/graphics/vulkan/pipeline_cache.h
+index ba73765..af73e0c 100644
+--- a/include/rex/graphics/vulkan/pipeline_cache.h
++++ b/include/rex/graphics/vulkan/pipeline_cache.h
+@@ -240,6 +240,9 @@ class VulkanPipelineCache {
+     std::atomic<bool> is_placeholder{false};
+     // Submission that last used the pipeline (for vulkan_pipeline_live_limit).
+     mutable std::atomic<uint64_t> last_used_submission{0};
++    // Likely to need per-pipeline scratch (private) memory on Adreno - about
++    // 24 MB each (pipelines whose shaders contain guest loops).
++    std::atomic<bool> heavy{false};
+     Pipeline() = default;
+     Pipeline(const PipelineLayoutProvider* pipeline_layout_provider)
+         : pipeline_layout(pipeline_layout_provider) {}
+@@ -247,7 +250,8 @@ class VulkanPipelineCache {
+         : pipeline(other.pipeline.load(std::memory_order_acquire)),
+           pipeline_layout(other.pipeline_layout.load(std::memory_order_acquire)),
+           is_placeholder(other.is_placeholder.load(std::memory_order_acquire)),
+-          last_used_submission(other.last_used_submission.load(std::memory_order_relaxed)) {}
++          last_used_submission(other.last_used_submission.load(std::memory_order_relaxed)),
++          heavy(other.heavy.load(std::memory_order_relaxed)) {}
+     Pipeline& operator=(const Pipeline& other) {
+       if (this == &other) {
+         return *this;
+@@ -376,6 +380,7 @@ class VulkanPipelineCache {
+   // Destroys the least recently used pipelines above vulkan_pipeline_live_limit
+   // (they are recreated on demand).
+   void EvictPipelinesOverLimit();
++  static bool IsHeavyPipeline(const PipelineCreationArguments& creation_arguments);
+   uint64_t pipeline_eviction_check_counter_ = 0;
+   uint64_t pipelines_evicted_ = 0;
+   uint64_t pipelines_recreated_ = 0;
+diff --git a/src/graphics/vulkan/pipeline_cache.cpp b/src/graphics/vulkan/pipeline_cache.cpp
+index 334308d..f5f145d 100644
+--- a/src/graphics/vulkan/pipeline_cache.cpp
++++ b/src/graphics/vulkan/pipeline_cache.cpp
+@@ -59,12 +59,14 @@ REXCVAR_DEFINE_INT32(
+     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+ 
+ REXCVAR_DEFINE_INT32(vulkan_pipeline_live_limit, 0, "GPU/Vulkan",
+-                     "Keep at most this many graphics pipelines alive, destroying the least "
+-                     "recently used ones (recreated when needed again). Each pipeline can take "
+-                     "about 10 MB of GPU memory on Adreno. 0 = no limit");
++                     "Keep at most this many heavy graphics pipelines (shaders with guest loops, "
++                     "which take about 24 MB of scratch GPU memory each on Adreno) alive, "
++                     "destroying the least recently used ones (recreated when needed again). "
++                     "Other pipelines are not limited. 0 = no limit");
+ REXCVAR_DEFINE_INT32(vulkan_pipeline_preload_limit, -1, "GPU/Vulkan",
+-                     "Create at most this many pipelines from the pipeline storage at startup "
+-                     "(the rest are created when first needed). -1 = all");
++                     "Create at most this many heavy pipelines (see vulkan_pipeline_live_limit) from "
++                     "the pipeline storage at startup (the rest are created when first needed; "
++                     "other pipelines are always created). -1 = all");
+ REXCVAR_DEFINE_BOOL(vulkan_debug_pipeline_memory, false, "GPU/Vulkan",
+                     "Diagnostic: log how much GPU memory (Adreno kgsl) each pipeline creation "
+                     "takes, with shader details (creations are serialized while enabled)");
+@@ -606,6 +608,7 @@ void VulkanPipelineCache::InitializeShaderStorage(const std::filesystem::path& c
+ 
+   // Create the pipelines.
+   std::vector<PipelineCreationArguments> pipeline_creations;
++  uint32_t preload_heavy_count = 0;
+   pipeline_creations.reserve(pipeline_stored_descriptions.size());
+   for (const PipelineStoredDescription& pipeline_stored_description :
+        pipeline_stored_descriptions) {
+@@ -637,10 +640,13 @@ void VulkanPipelineCache::InitializeShaderStorage(const std::filesystem::path& c
+                                    : pipeline_description.depth_write_enable != 0;
+     creation_arguments.priority = pipeline_util::CalculatePipelinePriority(
+         bound_rts, shader_writes_color_targets, shader_writes_depth);
+-    if (REXCVAR_GET(vulkan_pipeline_preload_limit) >= 0 &&
+-        pipeline_creations.size() >= size_t(REXCVAR_GET(vulkan_pipeline_preload_limit))) {
+-      // Keep the description - the pipeline will be created when first used.
+-      continue;
++    if (IsHeavyPipeline(creation_arguments)) {
++      if (REXCVAR_GET(vulkan_pipeline_preload_limit) >= 0 &&
++          preload_heavy_count >= uint32_t(REXCVAR_GET(vulkan_pipeline_preload_limit))) {
++        // Keep the description - the pipeline will be created when first used.
++        continue;
++      }
++      ++preload_heavy_count;
+     }
+     pipeline_creations.push_back(creation_arguments);
+   }
+@@ -816,6 +822,20 @@ void VulkanPipelineCache::EndSubmission() {
+   EvictPipelinesOverLimit();
+ }
+ 
++bool VulkanPipelineCache::IsHeavyPipeline(const PipelineCreationArguments& creation_arguments) {
++  // Measured on Adreno 740: pipelines get about 24 MB of private (scratch)
++  // memory when the pixel shader (or, with a pixel shader, the vertex shader)
++  // contains guest loops; others take next to nothing.
++  if (!creation_arguments.pixel_shader) {
++    return false;
++  }
++  if (creation_arguments.pixel_shader->shader().constant_register_map().loop_bitmap) {
++    return true;
++  }
++  return creation_arguments.vertex_shader &&
++         creation_arguments.vertex_shader->shader().constant_register_map().loop_bitmap != 0;
++}
++
+ void VulkanPipelineCache::EvictPipelinesOverLimit() {
+   int32_t limit = REXCVAR_GET(vulkan_pipeline_live_limit);
+   if (limit <= 0 || (++pipeline_eviction_check_counter_ & 15) != 0) {
+@@ -825,7 +845,8 @@ void VulkanPipelineCache::EvictPipelinesOverLimit() {
+   std::vector<std::pair<uint64_t, std::pair<const PipelineDescription, Pipeline>*>> candidates;
+   size_t live_count = 0;
+   for (auto& pipeline_pair : pipelines_) {
+-    if (pipeline_pair.second.pipeline.load(std::memory_order_acquire) == VK_NULL_HANDLE) {
++    if (pipeline_pair.second.pipeline.load(std::memory_order_acquire) == VK_NULL_HANDLE ||
++        !pipeline_pair.second.heavy.load(std::memory_order_relaxed)) {
+       continue;
+     }
+     ++live_count;
+@@ -864,7 +885,7 @@ void VulkanPipelineCache::EvictPipelinesOverLimit() {
+       ++pipelines_evicted_;
+     }
+   }
+-  REXGPU_INFO("[gpu-pipelines] live={} limit={} evicted now={} total evicted={} recreated={}",
++  REXGPU_INFO("[gpu-pipelines] heavy live={} limit={} evicted now={} total evicted={} recreated={}",
+               live_count, limit, to_evict, pipelines_evicted_, pipelines_recreated_);
+ }
+ 
+@@ -3631,6 +3652,9 @@ bool VulkanPipelineCache::EnsurePipelineCreated(const PipelineCreationArguments&
+         uint32_t(use_dynamic_rendering));
+     return false;
+   }
++  creation_arguments.pipeline->second.heavy.store(
++      fragment_shader_override == VK_NULL_HANDLE && IsHeavyPipeline(creation_arguments),
++      std::memory_order_relaxed);
+   bool was_placeholder =
+       creation_arguments.pipeline->second.is_placeholder.load(std::memory_order_acquire);
+   VkPipeline old_pipeline =
+-- 
+2.43.0
+

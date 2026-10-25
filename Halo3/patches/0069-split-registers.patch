@@ -1,0 +1,195 @@
+From 1bb137804ce720935075540f831bf5ba4447f8c0 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 22 Oct 2026 21:25:17 -0400
+Subject: [PATCH] spirv: gpu_shader_split_registers - one variable per guest
+ register when there is no dynamic register addressing (Adreno puts register
+ arrays in ~10 MB of scratch memory per pipeline)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01JJM25S15YdvewrFFwP8g6Z
+---
+ .../pipeline/shader/spirv_translator.h        |  3 +
+ .../pipeline/shader/spirv_translator.cpp      | 67 +++++++++++++------
+ .../pipeline/shader/spirv_translator_rb.cpp   |  3 +-
+ 3 files changed, 51 insertions(+), 22 deletions(-)
+
+diff --git a/include/rex/graphics/pipeline/shader/spirv_translator.h b/include/rex/graphics/pipeline/shader/spirv_translator.h
+index 96ef8ac..63cd56c 100644
+--- a/include/rex/graphics/pipeline/shader/spirv_translator.h
++++ b/include/rex/graphics/pipeline/shader/spirv_translator.h
+@@ -976,6 +976,9 @@ class SpirvShaderTranslator : public ShaderTranslator {
+   spv::Id var_main_tfetch_gradients_v_;
+   // float4[register_count()].
+   spv::Id var_main_registers_;
++  // With gpu_shader_split_registers, one variable per register.
++  std::vector<spv::Id> var_main_registers_split_;
++  spv::Id RegisterAccessChain(const std::vector<spv::Id>& indices);
+   // Memory export variables are created only when needed.
+   // float4.
+   spv::Id var_main_memexport_address_;
+diff --git a/src/graphics/pipeline/shader/spirv_translator.cpp b/src/graphics/pipeline/shader/spirv_translator.cpp
+index fc54628..548c872 100644
+--- a/src/graphics/pipeline/shader/spirv_translator.cpp
++++ b/src/graphics/pipeline/shader/spirv_translator.cpp
+@@ -36,6 +36,10 @@ REXCVAR_DEFINE_BOOL(vulkan_spirv_sample_rate_shading, true, "GPU/Vulkan",
+ REXCVAR_DEFINE_BOOL(gpu_shader_allow_fma, false, "GPU/Shader",
+                     "Allow the driver to fuse multiply-adds in translated pixel shaders (faster, "
+                     "results can differ in the last bits)");
++REXCVAR_DEFINE_BOOL(gpu_shader_split_registers, false, "GPU/Shader",
++                    "Keep each guest register of a shader without dynamic register addressing in "
++                    "its own variable instead of one array (some mobile drivers put such arrays in "
++                    "per-pipeline scratch memory - about 10 MB of GPU memory per pipeline on Adreno)");
+ REXCVAR_DEFINE_INT32(vulkan_spirv_max_version, 0, "GPU/Vulkan",
+                      "Highest SPIR-V version to emit, as 10/13/14/15 (0 = highest supported)");
+ 
+@@ -552,11 +556,25 @@ void SpirvShaderTranslator::StartTranslation() {
+     var_main_tfetch_gradients_v_ =
+         builder_->createVariable(spv::NoPrecision, spv::StorageClassFunction, type_float3_,
+                                  "xe_var_tfetch_gradients_v", const_float3_0_);
++    var_main_registers_split_.clear();
+     if (register_count()) {
+-      spv::Id type_register_array =
+-          builder_->makeArrayType(type_float4_, builder_->makeUintConstant(register_count()), 1);
+-      var_main_registers_ = builder_->createVariable(spv::NoPrecision, spv::StorageClassFunction,
+-                                                     type_register_array, "xe_var_registers");
++      if (REXCVAR_GET(gpu_shader_split_registers) &&
++          !current_shader().uses_register_dynamic_addressing()) {
++        for (uint32_t i = 0; i < register_count(); ++i) {
++          var_main_registers_split_.push_back(builder_->createVariable(
++              spv::NoPrecision, spv::StorageClassFunction, type_float4_,
++              fmt::format("xe_var_r{}", i).c_str()));
++        }
++        // Not used for access in this mode, but kept non-null for the
++        // existing checks.
++        var_main_registers_ = var_main_registers_split_[0];
++      } else {
++        spv::Id type_register_array =
++            builder_->makeArrayType(type_float4_, builder_->makeUintConstant(register_count()), 1);
++        var_main_registers_ = builder_->createVariable(spv::NoPrecision,
++                                                       spv::StorageClassFunction,
++                                                       type_register_array, "xe_var_registers");
++      }
+     }
+     if (IsSpirvRectangleListVertexLoopEnabled()) {
+       Modification shader_modification = GetSpirvShaderModification();
+@@ -840,8 +858,7 @@ std::vector<uint8_t> SpirvShaderTranslator::CompleteTranslation() {
+           id_vector_temp_.clear();
+           id_vector_temp_.push_back(builder_->makeIntConstant(int(i)));
+           builder_->createStore(const_float4_0_,
+-                                builder_->createAccessChain(spv::StorageClassFunction,
+-                                                            var_main_registers_, id_vector_temp_));
++                                RegisterAccessChain(id_vector_temp_));
+         }
+         uint32_t iteration_interpolators_remaining = GetModificationInterpolatorMask();
+         while (rex::bit_scan_forward(iteration_interpolators_remaining, &interpolator_index)) {
+@@ -975,8 +992,7 @@ std::vector<uint8_t> SpirvShaderTranslator::CompleteTranslation() {
+           id_vector_temp_.push_back(const_int_0_);
+           id_vector_temp_.push_back(const_int_0_);
+           builder_->createStore(rectangle_vertex_index_float,
+-                                builder_->createAccessChain(spv::StorageClassFunction,
+-                                                            var_main_registers_, id_vector_temp_));
++                                RegisterAccessChain(id_vector_temp_));
+         }
+ 
+         if (has_main_switch) {
+@@ -1842,8 +1858,7 @@ void SpirvShaderTranslator::StartVertexOrTessEvalShaderInMain() {
+     id_vector_temp_.clear();
+     id_vector_temp_.push_back(builder_->makeIntConstant(int(i)));
+     builder_->createStore(
+-        const_float4_0_, builder_->createAccessChain(spv::StorageClassFunction, var_main_registers_,
+-                                                     id_vector_temp_));
++        const_float4_0_, RegisterAccessChain(id_vector_temp_));
+   }
+ 
+   if (!IsSpirvComputeShader()) {
+@@ -1908,8 +1923,7 @@ void SpirvShaderTranslator::StartVertexOrTessEvalShaderInMain() {
+       id_vector_temp_.push_back(builder_->makeIntConstant(int(register_index)));
+       id_vector_temp_.push_back(builder_->makeIntConstant(int(component)));
+       builder_->createStore(
+-          value, builder_->createAccessChain(spv::StorageClassFunction, var_main_registers_,
+-                                             id_vector_temp_));
++          value, RegisterAccessChain(id_vector_temp_));
+     };
+     if (IsSpirvTessEvalShader()) {
+       auto load_tess_coord_component = [this](uint32_t component) {
+@@ -3222,8 +3236,7 @@ void SpirvShaderTranslator::StartFragmentShaderInMain() {
+         (i < xenos::kMaxInterpolators && (interpolator_mask & (UINT32_C(1) << i)))
+             ? builder_->createLoad(input_output_interpolators_[i], spv::NoPrecision)
+             : const_float4_0_,
+-        builder_->createAccessChain(spv::StorageClassFunction, var_main_registers_,
+-                                    id_vector_temp_));
++        RegisterAccessChain(id_vector_temp_));
+   }
+ 
+   // Pixel parameters.
+@@ -3341,8 +3354,7 @@ void SpirvShaderTranslator::StartFragmentShaderInMain() {
+     id_vector_temp_.clear();
+     id_vector_temp_.push_back(builder_->makeIntConstant(int(param_gen_interpolator)));
+     builder_->createStore(
+-        param_gen, builder_->createAccessChain(spv::StorageClassFunction, var_main_registers_,
+-                                               id_vector_temp_));
++        param_gen, RegisterAccessChain(id_vector_temp_));
+   }
+ 
+   if (!edram_fragment_shader_interlock_) {
+@@ -3541,6 +3553,23 @@ spv::Id SpirvShaderTranslator::GetStorageAddressingIndex(
+   return index;
+ }
+ 
++spv::Id SpirvShaderTranslator::RegisterAccessChain(const std::vector<spv::Id>& indices) {
++  if (var_main_registers_split_.empty()) {
++    return builder_->createAccessChain(spv::StorageClassFunction, var_main_registers_, indices);
++  }
++  assert_true(!indices.empty() && builder_->isConstantScalar(indices[0]));
++  uint32_t register_index = builder_->getConstantScalar(indices[0]);
++  if (register_index >= var_main_registers_split_.size()) {
++    register_index = uint32_t(var_main_registers_split_.size() - 1);
++  }
++  spv::Id variable = var_main_registers_split_[register_index];
++  if (indices.size() == 1) {
++    return variable;
++  }
++  std::vector<spv::Id> rest(indices.begin() + 1, indices.end());
++  return builder_->createAccessChain(spv::StorageClassFunction, variable, rest);
++}
++
+ spv::Id SpirvShaderTranslator::LoadOperandStorage(const InstructionOperand& operand) {
+   spv::Id index =
+       GetStorageAddressingIndex(operand.storage_addressing_mode, operand.storage_index,
+@@ -3553,8 +3582,7 @@ spv::Id SpirvShaderTranslator::LoadOperandStorage(const InstructionOperand& oper
+       id_vector_temp_util_.clear();
+       // Array element.
+       id_vector_temp_util_.push_back(index);
+-      vec4_pointer = builder_->createAccessChain(spv::StorageClassFunction, var_main_registers_,
+-                                                 id_vector_temp_util_);
++      vec4_pointer = RegisterAccessChain(id_vector_temp_util_);
+       break;
+     case InstructionStorageSource::kConstantFloat:
+       assert_true(uniform_float_constants_ != spv::NoResult);
+@@ -3672,8 +3700,7 @@ void SpirvShaderTranslator::StoreResult(const InstructionResult& result, spv::Id
+       id_vector_temp_util_.clear();
+       // Array element.
+       id_vector_temp_util_.push_back(register_index);
+-      target_pointer = builder_->createAccessChain(spv::StorageClassFunction, var_main_registers_,
+-                                                   id_vector_temp_util_);
++      target_pointer = RegisterAccessChain(id_vector_temp_util_);
+     } break;
+     case InstructionStorageTarget::kInterpolator: {
+       assert_true(is_vertex_shader());
+diff --git a/src/graphics/pipeline/shader/spirv_translator_rb.cpp b/src/graphics/pipeline/shader/spirv_translator_rb.cpp
+index 54431cb..5e9019b 100644
+--- a/src/graphics/pipeline/shader/spirv_translator_rb.cpp
++++ b/src/graphics/pipeline/shader/spirv_translator_rb.cpp
+@@ -420,8 +420,7 @@ void SpirvShaderTranslator::CompleteFragmentShaderInMain() {
+         id_vector_temp_.clear();
+         id_vector_temp_.push_back(builder_->makeIntConstant(int(pg_index)));
+         spv::Id pg = builder_->createLoad(
+-            builder_->createAccessChain(spv::StorageClassFunction, var_main_registers_,
+-                                        id_vector_temp_),
++            RegisterAccessChain(id_vector_temp_),
+             spv::NoPrecision);
+         pg_x = builder_->createUnaryBuiltinCall(
+             type_float_, ext_inst_glsl_std_450_, GLSLstd450FAbs,
+-- 
+2.43.0
+

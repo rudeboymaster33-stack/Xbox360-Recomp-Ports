@@ -1,0 +1,72 @@
+From 760f0cbd7a19ceca2f22999a87936fc0f683386f Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 23 Oct 2026 22:58:23 -0400
+Subject: [PATCH] Hitch detector: log frames over 50 ms with their per-frame
+ work, and a 300-frame summary
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01JJM25S15YdvewrFFwP8g6Z
+---
+ src/graphics/vulkan/command_processor.cpp | 46 +++++++++++++++++++++++
+ 1 file changed, 46 insertions(+)
+
+diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
+index 55734b5..0c9d88e 100644
+--- a/src/graphics/vulkan/command_processor.cpp
++++ b/src/graphics/vulkan/command_processor.cpp
+@@ -2571,6 +2571,52 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
+   }
+   {
+     GpuFrameStats& st = GetGpuFrameStats();
++    {
++      // Hitch detector: frames much longer than 33 ms, with what this frame did.
++      static auto hitch_last_time = std::chrono::steady_clock::now();
++      static GpuFrameStats hitch_prev;
++      static uint32_t hitch_over_40 = 0, hitch_over_60 = 0, hitch_over_100 = 0;
++      static double hitch_max_ms = 0.0;
++      static uint64_t hitch_frame = 0;
++      auto now = std::chrono::steady_clock::now();
++      double frame_ms = std::chrono::duration<double, std::milli>(now - hitch_last_time).count();
++      hitch_last_time = now;
++      ++hitch_frame;
++      // Counters are reset every 120 frames - only diff within a window.
++      bool same_window = st.frames != 0;
++      auto delta = [&](uint64_t cur, uint64_t prev) -> uint64_t {
++        return same_window && cur >= prev ? cur - prev : cur;
++      };
++      if (hitch_frame > 60) {
++        hitch_over_40 += frame_ms > 40.0;
++        hitch_over_60 += frame_ms > 60.0;
++        hitch_over_100 += frame_ms > 100.0;
++        hitch_max_ms = std::max(hitch_max_ms, frame_ms);
++        if (frame_ms > 50.0) {
++          REXGPU_INFO(
++              "[gpu-hitch] frame {} took {:.1f} ms: draws={} texture_loads={} shm_uploads={} "
++              "shm_upload={}KB resolves={} transfer_passes={} fence_waits={} fence_wait={:.1f}ms "
++              "submissions={}",
++              hitch_frame, frame_ms, delta(st.draws, hitch_prev.draws),
++              delta(st.texture_loads, hitch_prev.texture_loads),
++              delta(st.shm_uploads, hitch_prev.shm_uploads),
++              delta(st.shm_upload_kb, hitch_prev.shm_upload_kb),
++              delta(st.resolves, hitch_prev.resolves),
++              delta(st.transfer_passes, hitch_prev.transfer_passes),
++              delta(st.fence_waits, hitch_prev.fence_waits),
++              delta(st.fence_wait_us, hitch_prev.fence_wait_us) / 1000.0,
++              delta(st.submissions, hitch_prev.submissions));
++        }
++        if (hitch_frame % 300 == 0) {
++          REXGPU_INFO("[gpu-hitch] last 300 frames: over 40 ms={} over 60 ms={} over 100 ms={} "
++                      "longest={:.1f} ms",
++                      hitch_over_40, hitch_over_60, hitch_over_100, hitch_max_ms);
++          hitch_over_40 = hitch_over_60 = hitch_over_100 = 0;
++          hitch_max_ms = 0.0;
++        }
++      }
++      hitch_prev = st;
++    }
+     if (++st.frames >= 120) {
+       double f = double(st.frames);
+       static auto fps_last_time = std::chrono::steady_clock::now();
+-- 
+2.43.0
+

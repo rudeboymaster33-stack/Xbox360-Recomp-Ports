@@ -1,0 +1,68 @@
+From 33006ac9a1cac6cea2b9ae571da132dc3941b670 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 24 Oct 2026 09:44:44 -0400
+Subject: [PATCH] [gpu-time-swaps]: GPU-side frame-to-frame time distribution
+ with vulkan_gpu_timestamps
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01JJM25S15YdvewrFFwP8g6Z
+---
+ .../rex/graphics/vulkan/command_processor.h   |  4 ++++
+ src/graphics/vulkan/command_processor.cpp     | 19 +++++++++++++++++++
+ 2 files changed, 23 insertions(+)
+
+diff --git a/include/rex/graphics/vulkan/command_processor.h b/include/rex/graphics/vulkan/command_processor.h
+index ead39ad..65a7b89 100644
+--- a/include/rex/graphics/vulkan/command_processor.h
++++ b/include/rex/graphics/vulkan/command_processor.h
+@@ -856,6 +856,10 @@ class VulkanCommandProcessor : public CommandProcessor {
+   uint64_t gpu_ts_last_submission_ = 0;
+   double gpu_ts_ns_[kGpuSegCount] = {};
+   double gpu_ts_idle_ns_ = 0.0;
++  // GPU-side time between the starts of consecutive swap passes.
++  uint64_t gpu_ts_last_swap_ = 0;
++  uint32_t gpu_ts_swap_over_40_ = 0, gpu_ts_swap_over_60_ = 0, gpu_ts_swap_count_ = 0;
++  double gpu_ts_swap_max_ms_ = 0.0;
+   uint64_t gpu_ts_batches_read_ = 0;
+   uint64_t gpu_ts_batches_skipped_ = 0;
+   static constexpr uint32_t kGpuTsSlots = 16;
+diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
+index 0c9d88e..476982b 100644
+--- a/src/graphics/vulkan/command_processor.cpp
++++ b/src/graphics/vulkan/command_processor.cpp
+@@ -3929,6 +3929,19 @@ void VulkanCommandProcessor::GpuTsCollect() {
+           }
+           uint32_t tag = b.tags[i];
+           uint32_t cat = tag & 0xFF;
++          if (cat == kGpuSegSwapPass) {
++            if (gpu_ts_last_swap_) {
++              double swap_ms = double((ts[i] - gpu_ts_last_swap_) & gpu_ts_valid_mask_) *
++                               gpu_ts_period_ns_ * 1.0e-6;
++              if (swap_ms < 1000.0) {
++                ++gpu_ts_swap_count_;
++                gpu_ts_swap_over_40_ += swap_ms > 40.0;
++                gpu_ts_swap_over_60_ += swap_ms > 60.0;
++                gpu_ts_swap_max_ms_ = std::max(gpu_ts_swap_max_ms_, swap_ms);
++              }
++            }
++            gpu_ts_last_swap_ = ts[i];
++          }
+           if (cat < kGpuSegCount) {
+             gpu_ts_ns_[cat] += ns;
+           }
+@@ -3974,6 +3987,12 @@ void VulkanCommandProcessor::GpuTsLog(double frames) {
+       gpu_ts_ns_[kGpuSegSwapPass] * ms, gpu_ts_idle_ns_ * ms, gpu_ts_batches_read_,
+       gpu_ts_batches_skipped_, gpu_ts_ns_[kGpuSegResolve] * ms,
+       gpu_ts_ns_[kGpuSegTextureLoad] * ms);
++  REXGPU_INFO("[gpu-time-swaps] GPU frame-to-frame: frames={} over 40 ms={} over 60 ms={} "
++              "longest={:.1f} ms",
++              gpu_ts_swap_count_, gpu_ts_swap_over_40_, gpu_ts_swap_over_60_,
++              gpu_ts_swap_max_ms_);
++  gpu_ts_swap_count_ = gpu_ts_swap_over_40_ = gpu_ts_swap_over_60_ = 0;
++  gpu_ts_swap_max_ms_ = 0.0;
+   for (uint32_t i = 0; i < kGpuTsSlots && gpu_ts_slot_keys_[i]; ++i) {
+     if (gpu_ts_slot_cpu_passes_[i] == 0) {
+       continue;
+-- 
+2.43.0
+

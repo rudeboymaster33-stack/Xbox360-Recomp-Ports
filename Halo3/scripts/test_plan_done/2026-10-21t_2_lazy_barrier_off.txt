@@ -1,2 +1,0 @@
-#wait=70
---vulkan_lazy_memexport_barrier=false

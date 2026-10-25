@@ -1,3 +1,0 @@
-#wait=70
---readback_memexport=false
---occlusion_query_enable=false

@@ -1,0 +1,148 @@
+From 289aa88d07ae75465a3d49ac1898f1155bb3a4e1 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 24 Oct 2026 11:44:55 -0400
+Subject: [PATCH] memexport compute hoist: allow vertex-textured updates, log
+ why updates aren't hoisted, diagnostic ignore-reads switch
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01JJM25S15YdvewrFFwP8g6Z
+---
+ src/graphics/vulkan/command_processor.cpp | 69 +++++++++++++++--------
+ src/graphics/vulkan/gpu_frame_stats.h     |  7 ++-
+ 2 files changed, 52 insertions(+), 24 deletions(-)
+
+diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
+index 857278c..3998ea2 100644
+--- a/src/graphics/vulkan/command_processor.cpp
++++ b/src/graphics/vulkan/command_processor.cpp
+@@ -76,6 +76,9 @@ REXCVAR_DEFINE_BOOL(vulkan_memexport_compute_hoist, false, "GPU/Vulkan",
+                     "Run memory-export-only vertex shader draws (GPU particle updates) as "
+                     "compute dispatches moved to before the open render pass, instead of "
+                     "ending the pass for their barriers");
++REXCVAR_DEFINE_BOOL(vulkan_memexport_compute_hoist_ignore_reads, false, "GPU/Vulkan",
++                    "Diagnostic: hoist particle updates even if a draw earlier in the pass read "
++                    "the memory they write (may break effects)");
+ REXCVAR_DEFINE_BOOL(vulkan_memexport_barrier_in_pass, false, "GPU/Vulkan",
+                     "Keep the render pass open across barriers for memory exported by vertex "
+                     "shaders (GPU particles) using render pass self-dependencies; needs "
+@@ -2683,10 +2686,12 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
+       }
+       REXGPU_INFO(
+           "[gpu-hoist] per frame: uploads_moved_before_pass={:.1f} uploads_kept={:.1f} "
+-          "shm_barriers_in_pass={:.1f} memexport_barriers_deferred={:.1f} memexport_barriers_kept_in_pass={:.1f} memexport_compute_hoisted={:.1f}",
++          "shm_barriers_in_pass={:.1f} memexport_barriers_deferred={:.1f} memexport_barriers_kept_in_pass={:.1f} memexport_compute_hoisted={:.1f} blocked: no_ranges={:.1f} draw_type={:.1f} no_pass={:.1f} after_inline={:.1f} read_in_pass={:.1f}",
+           st.shm_hoisted / f, st.shm_hoist_blocked / f, st.shm_use_barriers_in_pass / f,
+           st.shm_memexport_deferred / f, st.shm_memexport_in_pass_barriers / f,
+-          st.memexport_compute_hoisted / f);
++          st.memexport_compute_hoisted / f, st.memexport_hoist_blocked_no_ranges / f,
++          st.memexport_hoist_blocked_draw_type / f, st.memexport_hoist_blocked_no_pass / f,
++          st.memexport_hoist_blocked_after_inline / f, st.memexport_hoist_blocked_read_in_pass / f);
+       REXGPU_INFO(
+           "[gpu-query] per frame: queries={:.1f} draws_in_queries={:.1f} skipped={:.1f} "
+           "kept_zwrite={:.1f} kept_color={:.1f} kept_other={:.1f}",
+@@ -5210,28 +5215,38 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+   uint32_t memexport_hoist_index = 0;
+   uint32_t memexport_hoist_vertex_count = 0;
+   if (REXCVAR_GET(vulkan_memexport_compute_hoist) && memexport_used_vertex &&
+-      !memexport_used_pixel && !pixel_shader && !is_rasterization_done &&
+-      !memexport_ranges_.empty() &&
+-      primitive_processing_result.host_vertex_shader_type ==
+-          Shader::HostVertexShaderType::kVertex &&
+-      (primitive_processing_result.index_buffer_type ==
+-           PrimitiveProcessor::ProcessedIndexBufferType::kNone ||
+-       primitive_processing_result.index_buffer_type ==
+-           PrimitiveProcessor::ProcessedIndexBufferType::kGuestDMA) &&
+-      !vertex_shader->GetUsedTextureMaskAfterTranslation() && !scope_inline_memexport_ &&
+-      GetDrawPassHoistPoint(memexport_hoist_index)) {
+-    memexport_compute_hoist = true;
+-    for (const draw_util::MemExportRange& range : memexport_ranges_) {
+-      if (shared_memory_->ScopeReadsOverlapBytes(range.base_address_dwords << 2,
+-                                                 range.size_bytes)) {
++      !memexport_used_pixel && !pixel_shader && !is_rasterization_done) {
++    GpuFrameStats& hoist_stats = GetGpuFrameStats();
++    if (memexport_ranges_.empty()) {
++      ++hoist_stats.memexport_hoist_blocked_no_ranges;
++    } else if (primitive_processing_result.host_vertex_shader_type !=
++                   Shader::HostVertexShaderType::kVertex ||
++               (primitive_processing_result.index_buffer_type !=
++                    PrimitiveProcessor::ProcessedIndexBufferType::kNone &&
++                primitive_processing_result.index_buffer_type !=
++                    PrimitiveProcessor::ProcessedIndexBufferType::kGuestDMA)) {
++      ++hoist_stats.memexport_hoist_blocked_draw_type;
++    } else if (!GetDrawPassHoistPoint(memexport_hoist_index)) {
++      ++hoist_stats.memexport_hoist_blocked_no_pass;
++    } else if (scope_inline_memexport_) {
++      ++hoist_stats.memexport_hoist_blocked_after_inline;
++    } else {
++      memexport_compute_hoist = true;
++      if (!REXCVAR_GET(vulkan_memexport_compute_hoist_ignore_reads)) {
++        for (const draw_util::MemExportRange& range : memexport_ranges_) {
++          if (shared_memory_->ScopeReadsOverlapBytes(range.base_address_dwords << 2,
++                                                     range.size_bytes)) {
++            memexport_compute_hoist = false;
++            ++hoist_stats.memexport_hoist_blocked_read_in_pass;
++            break;
++          }
++        }
++      }
++      memexport_hoist_vertex_count = primitive_processing_result.guest_draw_vertex_count;
++      if (!memexport_hoist_vertex_count) {
+         memexport_compute_hoist = false;
+-        break;
+       }
+     }
+-    memexport_hoist_vertex_count = primitive_processing_result.guest_draw_vertex_count;
+-    if (!memexport_hoist_vertex_count) {
+-      memexport_compute_hoist = false;
+-    }
+   }
+ 
+   // Update system constants before uploading them.
+@@ -5337,16 +5352,24 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+           *vertex_shader, vertex_shader_modification,
+           current_guest_graphics_pipeline_layout_->GetPipelineLayout());
+     }
++    if (compute_pipeline == VK_NULL_HANDLE) {
++      ++GetGpuFrameStats().memexport_hoist_blocked_no_pass;
++    }
+     if (compute_pipeline != VK_NULL_HANDLE) {
+       uint32_t group_count_x =
+           std::min(memexport_hoist_vertex_count, SpirvShaderTranslator::kMemExportComputeDispatchX);
+       uint32_t group_count_y =
+           (memexport_hoist_vertex_count + SpirvShaderTranslator::kMemExportComputeDispatchX - 1) /
+           SpirvShaderTranslator::kMemExportComputeDispatchX;
++      // Vertex textures (if any) are bound for the draw already - textures
++      // that needed loading would have ended the pass above.
++      uint32_t hoist_set_count = uint32_t(SpirvShaderTranslator::kDescriptorSetConstants) + 1;
++      if (vertex_shader->GetUsedTextureMaskAfterTranslation()) {
++        hoist_set_count = uint32_t(SpirvShaderTranslator::kDescriptorSetTexturesVertex) + 1;
++      }
+       deferred_command_buffer_.AddHoistedDispatch(
+           memexport_hoist_index, compute_pipeline,
+-          current_guest_graphics_pipeline_layout_->GetPipelineLayout(), 0,
+-          uint32_t(SpirvShaderTranslator::kDescriptorSetConstants) + 1,
++          current_guest_graphics_pipeline_layout_->GetPipelineLayout(), 0, hoist_set_count,
+           current_graphics_descriptor_sets_, group_count_x, group_count_y, 1);
+       // The replay binds a compute pipeline before anything recorded later.
+       current_external_compute_pipeline_ = VK_NULL_HANDLE;
+diff --git a/src/graphics/vulkan/gpu_frame_stats.h b/src/graphics/vulkan/gpu_frame_stats.h
+index c629d3f..b836e47 100644
+--- a/src/graphics/vulkan/gpu_frame_stats.h
++++ b/src/graphics/vulkan/gpu_frame_stats.h
+@@ -33,7 +33,12 @@ struct GpuFrameStats {
+   uint64_t shm_hoist_blocked = 0;
+   uint64_t shm_use_barriers_in_pass = 0;   // shared memory barriers while a draw pass is open
+   uint64_t shm_memexport_in_pass_barriers = 0;
+-  uint64_t memexport_compute_hoisted = 0;  // particle updates run as hoisted compute  // memexport barriers kept inside the pass
++  uint64_t memexport_compute_hoisted = 0;  // particle updates run as hoisted compute
++  uint64_t memexport_hoist_blocked_no_ranges = 0;
++  uint64_t memexport_hoist_blocked_draw_type = 0;
++  uint64_t memexport_hoist_blocked_no_pass = 0;
++  uint64_t memexport_hoist_blocked_after_inline = 0;
++  uint64_t memexport_hoist_blocked_read_in_pass = 0;  // memexport barriers kept inside the pass
+   uint64_t shm_memexport_deferred = 0;     // memexport barriers deferred (no overlapping read)  // uploads in a draw pass that could not be moved
+   uint64_t queries = 0;              // guest occlusion queries begun
+   uint64_t query_draws = 0;          // draws issued while a guest query was open
+-- 
+2.43.0
+

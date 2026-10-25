@@ -1,0 +1,121 @@
+From 6eb39114ee606ce0427482fb1edeead249ed76b9 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 24 Oct 2026 20:06:24 -0400
+Subject: [PATCH] Audio: fade out/in around underruns instead of a hard cut
+ (audio_declick); [audio-pop] and [audio-underrun] logs
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01JJM25S15YdvewrFFwP8g6Z
+---
+ src/audio/sdl/sdl_audio_driver.cpp | 75 ++++++++++++++++++++++++++++++
+ 1 file changed, 75 insertions(+)
+
+diff --git a/src/audio/sdl/sdl_audio_driver.cpp b/src/audio/sdl/sdl_audio_driver.cpp
+index 5376212..eac4180 100644
+--- a/src/audio/sdl/sdl_audio_driver.cpp
++++ b/src/audio/sdl/sdl_audio_driver.cpp
+@@ -33,12 +33,23 @@ REXCVAR_DEFINE_BOOL(audio_limiter, true, "Audio",
+ REXCVAR_DEFINE_INT32(audio_device_sample_frames, 256, "Audio",
+                      "Samples the audio device asks for per callback (0 = SDL default, which "
+                      "took 4 game audio frames at once and left little buffer to the game)");
++REXCVAR_DEFINE_BOOL(audio_declick, true, "Audio",
++                    "When the game is late with audio, fade the last sound out (and back in) "
++                    "instead of cutting to silence - a hard cut is heard as a pop");
+ REXCVAR_DEFINE_BOOL(audio_stats, true, "Audio",
+                     "Log [audio-stats] every ~5 s: buffer underruns and peak levels");
+ 
+ namespace {
+ // Output stage state (one device): limiter gain and statistics.
+ float g_limiter_gain = 1.0f;
++// De-click state: the last output sample per side, and whether the next game
++// frame must fade in (an underrun or a jump was just output).
++float g_last_left = 0.0f;
++float g_last_right = 0.0f;
++bool g_fade_in = false;
++uint64_t g_underrun_log_ms = 0;
++uint32_t g_underruns_since_log = 0;
++uint32_t g_pops_logged = 0;
+ uint32_t g_stat_callbacks = 0;
+ uint32_t g_stat_underruns = 0;
+ uint32_t g_stat_frames = 0;
+@@ -224,6 +235,34 @@ void SDLAudioDriver::SDLCallback(void* userdata, SDL_AudioStream* stream, int ad
+         sdl_callback_count++;
+       }
+       std::memset(data, 0, len);
++      if (driver->sdl_device_channels_ == 2 && REXCVAR_GET(audio_declick) &&
++          (g_last_left != 0.0f || g_last_right != 0.0f)) {
++        // Continue from the last sample and decay to silence in ~1.5 ms.
++        float l = g_last_left, r = g_last_right;
++        for (uint32_t i = 0; i < channel_samples_; ++i) {
++          l *= 0.97f;
++          r *= 0.97f;
++          if (std::abs(l) < 1e-5f && std::abs(r) < 1e-5f) {
++            l = r = 0.0f;
++            break;
++          }
++          data[i * 2] = l;
++          data[i * 2 + 1] = r;
++        }
++        g_last_left = g_last_right = 0.0f;
++        g_fade_in = true;
++      }
++      if (g_had_audio && REXCVAR_GET(audio_stats)) {
++        ++g_underruns_since_log;
++        const uint64_t now_ms = SDL_GetTicks();
++        if (now_ms - g_underrun_log_ms >= 1000) {
++          REXAPU_INFO("[audio-underrun] {} block(s) of silence in the last {} ms (last level {:.2f})",
++                      g_underruns_since_log, now_ms - g_underrun_log_ms,
++                      std::max(std::abs(data[0]), std::abs(data[1])));
++          g_underrun_log_ms = now_ms;
++          g_underruns_since_log = 0;
++        }
++      }
+       if (!SDL_PutAudioStreamData(stream, data, len)) {
+         REXAPU_ERROR("SDL_PutAudioStreamData() failed while filling silence: {}", SDL_GetError());
+         break;
+@@ -269,6 +308,42 @@ void SDLAudioDriver::SDLCallback(void* userdata, SDL_AudioStream* stream, int ad
+                 data[i * 2] = std::clamp(left, -1.0f, 1.0f);
+                 data[i * 2 + 1] = std::clamp(right, -1.0f, 1.0f);
+               }
++              if (REXCVAR_GET(audio_declick) && g_fade_in) {
++                // Fade back in over ~1.3 ms after a gap.
++                const uint32_t n = std::min<uint32_t>(64, channel_samples_);
++                for (uint32_t i = 0; i < n; ++i) {
++                  const float t = float(i + 1) / float(n + 1);
++                  data[i * 2] *= t;
++                  data[i * 2 + 1] *= t;
++                }
++                g_fade_in = false;
++              }
++              if (REXCVAR_GET(audio_stats)) {
++                // Pop detector: a jump between neighbouring samples far larger
++                // than the sound around it.
++                float prev_l = g_last_left, prev_r = g_last_right;
++                float max_jump = 0.0f;
++                uint32_t jump_at = 0;
++                for (uint32_t i = 0; i < channel_samples_; ++i) {
++                  const float j = std::max(std::abs(data[i * 2] - prev_l),
++                                           std::abs(data[i * 2 + 1] - prev_r));
++                  if (j > max_jump) {
++                    max_jump = j;
++                    jump_at = i;
++                  }
++                  prev_l = data[i * 2];
++                  prev_r = data[i * 2 + 1];
++                }
++                if (max_jump > 0.35f && g_pops_logged < 200) {
++                  ++g_pops_logged;
++                  REXAPU_INFO("[audio-pop] jump {:.2f} at sample {} (frame peak {:.2f}, queued {}, "
++                              "limiter gain {:.2f})",
++                              max_jump, jump_at, frame_peak, driver->frames_queued_.size(),
++                              limiter_gain);
++                }
++              }
++              g_last_left = data[(channel_samples_ - 1) * 2];
++              g_last_right = data[(channel_samples_ - 1) * 2 + 1];
+               g_limiter_gain = limiter_gain;
+               g_stat_peak = std::max(g_stat_peak, frame_peak);
+               g_stat_min_gain = std::min(g_stat_min_gain, limiter_gain);
+-- 
+2.43.0
+

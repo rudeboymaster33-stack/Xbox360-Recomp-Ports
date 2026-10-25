@@ -29,6 +29,7 @@ endforeach()
 # Sources
 set(HALO3_SOURCES
     src/main.cpp
+    src/perf_overrides.cpp
 )
 
 if(ANDROID)

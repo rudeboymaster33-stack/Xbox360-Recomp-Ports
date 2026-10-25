@@ -1,3 +1,0 @@
-#wait=70
---async_shader_compilation=false
---gpu_debug_ps_position_out=*

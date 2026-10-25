@@ -1,3 +1,0 @@
-#wait=75
---vulkan_gpu_timestamps=true
---gpu_collapse_predicated_tiles=true

@@ -1,0 +1,28 @@
+From 6faea58d44278fa899ec1c06aafb61ae9e0c2a9b Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 24 Oct 2026 10:17:36 -0400
+Subject: [PATCH] host_present_from_guest_thread_with_vsync off by default:
+ presenting from the GPU command thread stalls it on Android
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01JJM25S15YdvewrFFwP8g6Z
+---
+ src/ui/presenter.cpp | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/src/ui/presenter.cpp b/src/ui/presenter.cpp
+index 4ac290b..c5b07ce 100644
+--- a/src/ui/presenter.cpp
++++ b/src/ui/presenter.cpp
+@@ -29,7 +29,7 @@
+ REXCVAR_DEFINE_BOOL(host_present_from_non_ui_thread, true, "UI/Presenter",
+                     "Allow presentation from non-UI thread");
+ 
+-REXCVAR_DEFINE_BOOL(host_present_from_guest_thread_with_vsync, true, "UI/Presenter",
++REXCVAR_DEFINE_BOOL(host_present_from_guest_thread_with_vsync, false, "UI/Presenter",
+                     "Present each guest frame from the guest output thread even when the host "
+                     "presentation waits for vertical sync (paced presentation shows every frame "
+                     "exactly once instead of the UI thread dropping frames it can't keep up with)");
+-- 
+2.43.0
+

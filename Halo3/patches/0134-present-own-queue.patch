@@ -1,0 +1,72 @@
+From bf1c7d66a8da236ca8385957c8e389b00da555ad Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 24 Oct 2026 20:52:07 -0400
+Subject: [PATCH] Vulkan: present on a second queue of the graphics family
+ (vulkan_present_own_queue)
+
+vkQueuePresentKHR blocked up to 24 ms on Android (p90 17.6 ms) while holding
+the shared queue, so the command processor's vkQueueSubmit waited behind it
+(10-16 ms) and swaps missed their vblank (50 ms frames).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01JJM25S15YdvewrFFwP8g6Z
+---
+ src/ui/vulkan/vulkan_device.cpp    | 14 ++++++++++++++
+ src/ui/vulkan/vulkan_presenter.cpp |  8 +++++++-
+ 2 files changed, 21 insertions(+), 1 deletion(-)
+
+diff --git a/src/ui/vulkan/vulkan_device.cpp b/src/ui/vulkan/vulkan_device.cpp
+index 298c0f3..5d41ea4 100644
+--- a/src/ui/vulkan/vulkan_device.cpp
++++ b/src/ui/vulkan/vulkan_device.cpp
+@@ -22,6 +22,10 @@
+ #include <rex/string.h>
+ #include <rex/ui/vulkan/device.h>
+ 
++REXCVAR_DEFINE_BOOL(vulkan_present_own_queue, true, "UI/Vulkan",
++                    "Present the swapchain on a second queue of the graphics family when the "
++                    "device has one, so a present that blocks (Android) doesn't hold up the "
++                    "GPU emulation's submissions");
+ REXCVAR_DEFINE_BOOL(vulkan_robust_buffer_access, true, "UI/Vulkan",
+                     "Enable robustBufferAccess (bounds checks on every buffer access in shaders; "
+                     "slower on mobile GPUs, shared memory loads are in bounds by construction)");
+@@ -485,6 +489,16 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
+ 
+   device->queue_families_[device->queue_family_graphics_compute_].queues.resize(std::max(
+       size_t(1), device->queue_families_[device->queue_family_graphics_compute_].queues.size()));
++  if (with_swapchain && REXCVAR_GET(vulkan_present_own_queue) &&
++      queue_families[device->queue_family_graphics_compute_].queueCount >= 2 &&
++      device->queue_families_[device->queue_family_graphics_compute_].may_support_presentation) {
++    device->queue_families_[device->queue_family_graphics_compute_].queues.resize(
++        std::max(size_t(2),
++                 device->queue_families_[device->queue_family_graphics_compute_].queues.size()));
++    REXLOG_INFO("Vulkan: presenting on a second queue of family {} ({} queues available)",
++                device->queue_family_graphics_compute_,
++                queue_families[device->queue_family_graphics_compute_].queueCount);
++  }
+   if (device->queue_family_sparse_binding_ != UINT32_MAX) {
+     device->queue_families_[device->queue_family_sparse_binding_].queues.resize(std::max(
+         size_t(1), device->queue_families_[device->queue_family_sparse_binding_].queues.size()));
+diff --git a/src/ui/vulkan/vulkan_presenter.cpp b/src/ui/vulkan/vulkan_presenter.cpp
+index 76702bd..4d5f6d5 100644
+--- a/src/ui/vulkan/vulkan_presenter.cpp
++++ b/src/ui/vulkan/vulkan_presenter.cpp
+@@ -2452,8 +2452,14 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
+   VkResult present_result;
+   {
+     ScopedTraceMarker trace_marker_qp("p_queue_present");
++    // A second queue of the family (vulkan_present_own_queue) keeps a blocking
++    // present from holding the queue the GPU emulation submits to.
++    const uint32_t present_queue_index =
++        vulkan_device_->queue_families()[paint_context_.present_queue_family].queues.size() >= 2
++            ? 1
++            : 0;
+     const VulkanDevice::Queue::Acquisition queue_acquisition =
+-        vulkan_device_->AcquireQueue(paint_context_.present_queue_family, 0);
++        vulkan_device_->AcquireQueue(paint_context_.present_queue_family, present_queue_index);
+     present_result = dfn.vkQueuePresentKHR(queue_acquisition.queue(), &present_info);
+   }
+   switch (present_result) {
+-- 
+2.43.0
+

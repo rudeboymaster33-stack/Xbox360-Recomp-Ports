@@ -1,0 +1,78 @@
+From d951609112a8be87c05b9f9ef051ebbf2cbf1bc8 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 24 Oct 2026 14:50:13 -0400
+Subject: [PATCH] Paced presentation: beat follows the median of recent frame
+ intervals (vulkan_present_pacing_median), so late frames don't lower the
+ displayed rate for many frames
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01JJM25S15YdvewrFFwP8g6Z
+---
+ include/rex/ui/vulkan/presenter.h  |  6 ++++++
+ src/ui/vulkan/vulkan_presenter.cpp | 24 ++++++++++++++++++++++--
+ 2 files changed, 28 insertions(+), 2 deletions(-)
+
+diff --git a/include/rex/ui/vulkan/presenter.h b/include/rex/ui/vulkan/presenter.h
+index 571ee26..c6c656c 100644
+--- a/include/rex/ui/vulkan/presenter.h
++++ b/include/rex/ui/vulkan/presenter.h
+@@ -421,6 +421,12 @@ class VulkanPresenter final : public Presenter {
+     uint64_t timing_last_publish_count = 0;
+     uint64_t timing_last_call_ns = 0;
+     double timing_interval_ema_ns = 33333333.0;
++    // Recent frame intervals - the beat follows their median, so a few late
++    // frames don't slow the display cadence (and, through the FIFO queue, the
++    // game) for many frames afterwards.
++    double timing_intervals_ns[15] = {};
++    uint32_t timing_interval_count = 0;
++    uint32_t timing_interval_next = 0;
+     uint32_t timing_present_id = 0;
+     std::vector<VkImage> swapchain_images;
+     std::vector<SwapchainFramebuffer> swapchain_framebuffers;
+diff --git a/src/ui/vulkan/vulkan_presenter.cpp b/src/ui/vulkan/vulkan_presenter.cpp
+index 40a06d0..2677cd6 100644
+--- a/src/ui/vulkan/vulkan_presenter.cpp
++++ b/src/ui/vulkan/vulkan_presenter.cpp
+@@ -59,6 +59,10 @@ REXCVAR_DEFINE_INT32(vulkan_present_pacing_latency_ms, 25, "UI/Vulkan",
+ REXCVAR_DEFINE_INT32(vulkan_present_pacing_min_lead_ms, 25, "UI/Vulkan",
+                      "Paced presentation: a frame keeps its place in the cadence as long as it "
+                      "arrives at least this many ms before its scheduled time");
++REXCVAR_DEFINE_BOOL(vulkan_present_pacing_median, true, "Vulkan",
++                    "Paced presentation follows the median of the recent frame intervals "
++                    "instead of their running average, so a few late frames don't lower the "
++                    "displayed frame rate for many frames afterwards");
+ REXCVAR_DEFINE_BOOL(vulkan_present_skip_repeated_frames, false, "UI/Vulkan",
+                     "Paced presentation: don't present the same guest frame twice");
+ REXCVAR_DEFINE_INT32(vulkan_present_pacing_image_count, 4, "UI/Vulkan",
+@@ -2294,10 +2298,26 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
+         interval = std::clamp(interval, 1e6, 100e6);
+         paint_context_.timing_interval_ema_ns =
+             paint_context_.timing_interval_ema_ns * 0.9 + interval * 0.1;
++        const uint32_t kIntervalHistory = 15;
++        paint_context_.timing_intervals_ns[paint_context_.timing_interval_next] = interval;
++        paint_context_.timing_interval_next =
++            (paint_context_.timing_interval_next + 1) % kIntervalHistory;
++        paint_context_.timing_interval_count =
++            std::min(paint_context_.timing_interval_count + 1, kIntervalHistory);
+       }
+       paint_context_.timing_last_call_ns = now;
+-      uint64_t cycles = std::max<uint64_t>(
+-          1, uint64_t(std::llround(paint_context_.timing_interval_ema_ns / double(refresh))));
++      double beat_interval_ns = paint_context_.timing_interval_ema_ns;
++      if (REXCVAR_GET(vulkan_present_pacing_median) && paint_context_.timing_interval_count) {
++        double sorted_intervals[15];
++        uint32_t interval_count = paint_context_.timing_interval_count;
++        std::copy(paint_context_.timing_intervals_ns,
++                  paint_context_.timing_intervals_ns + interval_count, sorted_intervals);
++        std::nth_element(sorted_intervals, sorted_intervals + interval_count / 2,
++                         sorted_intervals + interval_count);
++        beat_interval_ns = sorted_intervals[interval_count / 2];
++      }
++      uint64_t cycles =
++          std::max<uint64_t>(1, uint64_t(std::llround(beat_interval_ns / double(refresh))));
+       uint64_t step = cycles * refresh;
+       // Keep every frame on an even beat. A frame that arrives a bit late
+       // (the game sometimes delivers frames 50 ms + 17 ms apart instead of
+-- 
+2.43.0
+

@@ -1,0 +1,321 @@
+From 570a073ca04b1e6961cfe18c1c92189cb4bc7d7f Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 24 Oct 2026 12:01:12 -0400
+Subject: [PATCH] Structured CF for nested if/else sharing an end; memexport
+ compute: 64-wide groups, async pipeline creation with the VkPipelineCache
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01JJM25S15YdvewrFFwP8g6Z
+---
+ .../pipeline/shader/spirv_translator.h        |  7 +-
+ .../rex/graphics/vulkan/command_processor.h   | 11 ++-
+ include/rex/graphics/vulkan/pipeline_cache.h  |  2 +
+ .../pipeline/shader/spirv_translator.cpp      | 62 +++++++++++--
+ src/graphics/vulkan/command_processor.cpp     | 90 ++++++++++++++-----
+ 5 files changed, 136 insertions(+), 36 deletions(-)
+
+diff --git a/include/rex/graphics/pipeline/shader/spirv_translator.h b/include/rex/graphics/pipeline/shader/spirv_translator.h
+index 5e4548f..f2fc6e9 100644
+--- a/include/rex/graphics/pipeline/shader/spirv_translator.h
++++ b/include/rex/graphics/pipeline/shader/spirv_translator.h
+@@ -213,6 +213,9 @@ class SpirvShaderTranslator : public ShaderTranslator {
+   // For Vulkan vertex memexport compute fallback dispatches.
+   static constexpr uint32_t kMemExportComputeDispatchX = 65535;
+   static constexpr uint32_t kMemExportComputeDispatchY = 65535;
++  // Invocations per workgroup (along X) of memexport-only vertex shaders
++  // translated to compute shaders.
++  static constexpr uint32_t kMemExportComputeGroupSize = 64;
+ 
+   // IF SYSTEM CONSTANTS ARE CHANGED OR ADDED, THE FOLLOWING MUST BE UPDATED:
+   // - SystemConstantIndex enum.
+@@ -1089,9 +1092,7 @@ class SpirvShaderTranslator : public ShaderTranslator {
+   };
+   bool AnalyzeStructuredControlFlow();
+   uint32_t structured_cf_index_ = 0;
+-  void ProcessControlFlowInstructionBegin(uint32_t cf_index) override {
+-    structured_cf_index_ = cf_index;
+-  }
++  void ProcessControlFlowInstructionBegin(uint32_t cf_index) override;
+   void CloseStructuredRegionsAtLabel(uint32_t cf_index);
+   bool use_main_switch_ = false;
+   bool structured_loops_ = false;
+diff --git a/include/rex/graphics/vulkan/command_processor.h b/include/rex/graphics/vulkan/command_processor.h
+index b62c674..9960e4e 100644
+--- a/include/rex/graphics/vulkan/command_processor.h
++++ b/include/rex/graphics/vulkan/command_processor.h
+@@ -15,6 +15,7 @@
+ #include <cstdint>
+ #include <deque>
+ #include <functional>
++#include <future>
+ #include <memory>
+ #include <set>
+ #include <string>
+@@ -819,7 +820,15 @@ class VulkanCommandProcessor : public CommandProcessor {
+   // A memexport draw was recorded inline in the current pass since its hoist
+   // point - later memexport work can't be moved before it.
+   bool scope_inline_memexport_ = false;
+-  std::unordered_map<uint64_t, VkPipeline> memexport_compute_pipelines_;
++  struct MemExportComputePipeline {
++    VkPipeline pipeline = VK_NULL_HANDLE;
++    // Created on a separate thread, so the first use doesn't stall the frame -
++    // the draw is done the usual (inline) way until it's ready.
++    std::future<VkPipeline> creation;
++    uint64_t ucode_hash = 0;
++  };
++  std::unordered_map<uint64_t, MemExportComputePipeline> memexport_compute_pipelines_;
++  void ShutdownMemExportComputePipelines();
+   VkPipeline GetMemExportComputePipeline(VulkanShader& vertex_shader,
+                                          SpirvShaderTranslator::Modification graphics_modification,
+                                          VkPipelineLayout pipeline_layout);
+diff --git a/include/rex/graphics/vulkan/pipeline_cache.h b/include/rex/graphics/vulkan/pipeline_cache.h
+index ec3b8c7..68d01d0 100644
+--- a/include/rex/graphics/vulkan/pipeline_cache.h
++++ b/include/rex/graphics/vulkan/pipeline_cache.h
+@@ -84,6 +84,8 @@ class VulkanPipelineCache {
+       const Shader& shader, uint32_t interpolator_mask, uint32_t param_gen_pos,
+       reg::RB_DEPTHCONTROL normalized_depth_control) const;
+ 
++  // The driver pipeline cache kept in a file (VK_NULL_HANDLE if disabled).
++  VkPipelineCache GetVkPipelineCache() const { return vk_pipeline_cache_; }
+   bool EnsureShadersTranslated(VulkanShader::VulkanTranslation* vertex_shader,
+                                VulkanShader::VulkanTranslation* pixel_shader);
+   // TODO(Triang3l): Return a deferred creation handle.
+diff --git a/src/graphics/pipeline/shader/spirv_translator.cpp b/src/graphics/pipeline/shader/spirv_translator.cpp
+index 5235205..d0d1368 100644
+--- a/src/graphics/pipeline/shader/spirv_translator.cpp
++++ b/src/graphics/pipeline/shader/spirv_translator.cpp
+@@ -1278,7 +1278,8 @@ std::vector<uint8_t> SpirvShaderTranslator::CompleteTranslation() {
+                           : (is_tess_eval_shader ? spv::ExecutionModelTessellationEvaluation
+                                                  : spv::ExecutionModelVertex);
+     if (is_compute_shader) {
+-      builder_->addExecutionMode(function_main_, spv::ExecutionModeLocalSize, 1, 1, 1);
++      builder_->addExecutionMode(function_main_, spv::ExecutionModeLocalSize,
++                                kMemExportComputeGroupSize, 1, 1);
+     } else if (is_tess_eval_shader) {
+       Modification shader_modification = GetSpirvShaderModification();
+       switch (shader_modification.vertex.host_vertex_shader_type) {
+@@ -1457,6 +1458,8 @@ bool SpirvShaderTranslator::AnalyzeStructuredControlFlow() {
+     uint32_t end;
+     uint32_t else_label;
+     bool in_else;
++    // The cf index of the jump opening an if / if-else region.
++    uint32_t start;
+   };
+   std::vector<Region> stack;
+   uint32_t loop_depth = 0;
+@@ -1496,7 +1499,7 @@ bool SpirvShaderTranslator::AnalyzeStructuredControlFlow() {
+             cfs[skip - 1].loop_end.address() != i + 1) {
+           return false;
+         }
+-        stack.push_back({true, skip - 1, 0, false});
++        stack.push_back({true, skip - 1, 0, false, UINT32_MAX});
+         ++loop_depth;
+       } break;
+       case ucode::ControlFlowOpcode::kLoopEnd:
+@@ -1513,6 +1516,32 @@ bool SpirvShaderTranslator::AnalyzeStructuredControlFlow() {
+         }
+         const StructuredJump& jump = it->second;
+         if (jump.kind == StructuredJumpKind::kElseSeparator) {
++          // Regions nested in the then-part that jump to the same end as this
++          // separator: control reaching their end continues to this separator,
++          // which jumps there anyway - end them here instead, so the nesting is
++          // proper. Common pattern:
++          //   (!p0) jmp L_else; ... (!p1) jmp L_inner_else; ... jmp L_end;
++          //   L_inner_else: ...; jmp L_end (the separator); L_else: ...; L_end:
++          while (!stack.empty() && !stack.back().is_loop &&
++                 stack.back().else_label != jump.else_label &&
++                 stack.back().end == jump.end &&
++                 (stack.back().in_else || stack.back().else_label == UINT32_MAX)) {
++            Region& inner = stack.back();
++            auto inner_it = structured_jumps_.find(inner.start);
++            if (inner_it == structured_jumps_.end()) {
++              return false;
++            }
++            inner_it->second.end = i;
++            if (inner_it->second.kind == StructuredJumpKind::kIfElse &&
++                inner_it->second.else_label >= 1) {
++              auto inner_separator_it = structured_jumps_.find(inner_it->second.else_label - 1);
++              if (inner_separator_it != structured_jumps_.end() &&
++                  inner_separator_it->second.kind == StructuredJumpKind::kElseSeparator) {
++                inner_separator_it->second.end = i;
++              }
++            }
++            stack.pop_back();
++          }
+           if (stack.empty() || stack.back().is_loop || stack.back().in_else ||
+               stack.back().else_label != jump.else_label) {
+             return false;
+@@ -1520,7 +1549,7 @@ bool SpirvShaderTranslator::AnalyzeStructuredControlFlow() {
+         } else {
+           stack.push_back({false, jump.end,
+                            jump.kind == StructuredJumpKind::kIfElse ? jump.else_label : UINT32_MAX,
+-                           false});
++                           false, i});
+         }
+       } break;
+       default:
+@@ -1534,6 +1563,19 @@ bool SpirvShaderTranslator::AnalyzeStructuredControlFlow() {
+   return stack.empty();
+ }
+ 
++void SpirvShaderTranslator::ProcessControlFlowInstructionBegin(uint32_t cf_index) {
++  structured_cf_index_ = cf_index;
++  // Regions re-ended at a non-label instruction by AnalyzeStructuredControlFlow
++  // (labels close regions in ProcessLabel).
++  if (structured_loops_ && !structured_region_stack_.empty()) {
++    const StructuredRegion& top = structured_region_stack_.back();
++    if (top.kind != StructuredRegion::Kind::kLoop && top.end == cf_index) {
++      CloseExecConditionals();
++      CloseStructuredRegionsAtLabel(cf_index);
++    }
++  }
++}
++
+ void SpirvShaderTranslator::CloseStructuredRegionsAtLabel(uint32_t cf_index) {
+   while (!structured_region_stack_.empty()) {
+     StructuredRegion& top = structured_region_stack_.back();
+@@ -2370,11 +2412,15 @@ void SpirvShaderTranslator::StartVertexOrTessEvalShaderInMain() {
+             spv::OpIAdd, type_uint_, global_invocation_x,
+             builder_->createBinOp(
+                 spv::OpIAdd, type_uint_,
+-                builder_->createBinOp(spv::OpIMul, type_uint_, global_invocation_y,
+-                                      builder_->makeUintConstant(kMemExportComputeDispatchX)),
+-                builder_->createBinOp(spv::OpIMul, type_uint_, global_invocation_z,
+-                                      builder_->makeUintConstant(kMemExportComputeDispatchX *
+-                                                                 kMemExportComputeDispatchY))));
++                builder_->createBinOp(
++                    spv::OpIMul, type_uint_, global_invocation_y,
++                    builder_->makeUintConstant(kMemExportComputeDispatchX *
++                                               kMemExportComputeGroupSize)),
++                builder_->createBinOp(
++                    spv::OpIMul, type_uint_, global_invocation_z,
++                    builder_->makeUintConstant(kMemExportComputeDispatchX *
++                                               kMemExportComputeGroupSize *
++                                               kMemExportComputeDispatchY))));
+ 
+         id_vector_temp_.clear();
+         id_vector_temp_.push_back(
+diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
+index 3998ea2..aba366a 100644
+--- a/src/graphics/vulkan/command_processor.cpp
++++ b/src/graphics/vulkan/command_processor.cpp
+@@ -2007,6 +2007,7 @@ bool VulkanCommandProcessor::SetupContext() {
+ 
+ void VulkanCommandProcessor::ShutdownContext() {
+   AwaitAllQueueOperationsCompletion();
++  ShutdownMemExportComputePipelines();
+   InvalidateAllVertexBufferResidency();
+   ShutdownOcclusionQueryResources();
+ 
+@@ -4224,31 +4225,67 @@ VkPipeline VulkanCommandProcessor::GetMemExportComputePipeline(
+                  uint64_t(reinterpret_cast<uintptr_t>(pipeline_layout));
+   auto it = memexport_compute_pipelines_.find(key);
+   if (it != memexport_compute_pipelines_.end()) {
+-    return it->second;
+-  }
+-  VkPipeline pipeline = VK_NULL_HANDLE;
+-  if (pipeline_cache_->EnsureShadersTranslated(translation, nullptr)) {
+-    VkShaderModule shader_module = translation->GetOrCreateShaderModule();
+-    if (shader_module != VK_NULL_HANDLE) {
+-      VkComputePipelineCreateInfo create_info = {};
+-      create_info.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+-      create_info.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+-      create_info.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+-      create_info.stage.module = shader_module;
+-      create_info.stage.pName = "main";
+-      create_info.layout = pipeline_layout;
+-      const ui::vulkan::VulkanDevice* vulkan_device = GetVulkanDevice();
+-      if (vulkan_device->functions().vkCreateComputePipelines(
+-              vulkan_device->device(), VK_NULL_HANDLE, 1, &create_info, nullptr, &pipeline) !=
+-          VK_SUCCESS) {
+-        pipeline = VK_NULL_HANDLE;
++    MemExportComputePipeline& entry = it->second;
++    if (entry.creation.valid()) {
++      if (entry.creation.wait_for(std::chrono::seconds(0)) != std::future_status::ready) {
++        return VK_NULL_HANDLE;
+       }
++      entry.pipeline = entry.creation.get();
++      REXGPU_INFO("[gpu-memexport] compute version of VS {:016X}: {}", entry.ucode_hash,
++                  entry.pipeline != VK_NULL_HANDLE ? "created" : "FAILED");
++    }
++    return entry.pipeline;
++  }
++  MemExportComputePipeline& entry = memexport_compute_pipelines_[key];
++  entry.ucode_hash = vertex_shader.ucode_data_hash();
++  // Translation is quick (and uses the translator owned by this thread), only
++  // the driver compilation is done asynchronously.
++  if (!pipeline_cache_->EnsureShadersTranslated(translation, nullptr)) {
++    REXGPU_INFO("[gpu-memexport] compute version of VS {:016X}: translation FAILED",
++                entry.ucode_hash);
++    return VK_NULL_HANDLE;
++  }
++  VkShaderModule shader_module = translation->GetOrCreateShaderModule();
++  if (shader_module == VK_NULL_HANDLE) {
++    REXGPU_INFO("[gpu-memexport] compute version of VS {:016X}: shader module FAILED",
++                entry.ucode_hash);
++    return VK_NULL_HANDLE;
++  }
++  const ui::vulkan::VulkanDevice* vulkan_device = GetVulkanDevice();
++  VkPipelineCache vk_pipeline_cache = pipeline_cache_->GetVkPipelineCache();
++  entry.creation = std::async(
++      std::launch::async, [vulkan_device, vk_pipeline_cache, shader_module, pipeline_layout]() {
++        VkComputePipelineCreateInfo create_info = {};
++        create_info.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
++        create_info.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
++        create_info.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
++        create_info.stage.module = shader_module;
++        create_info.stage.pName = "main";
++        create_info.layout = pipeline_layout;
++        VkPipeline pipeline = VK_NULL_HANDLE;
++        if (vulkan_device->functions().vkCreateComputePipelines(
++                vulkan_device->device(), vk_pipeline_cache, 1, &create_info, nullptr,
++                &pipeline) != VK_SUCCESS) {
++          pipeline = VK_NULL_HANDLE;
++        }
++        return pipeline;
++      });
++  return VK_NULL_HANDLE;
++}
++
++void VulkanCommandProcessor::ShutdownMemExportComputePipelines() {
++  const ui::vulkan::VulkanDevice* vulkan_device = GetVulkanDevice();
++  for (auto& entry_pair : memexport_compute_pipelines_) {
++    MemExportComputePipeline& entry = entry_pair.second;
++    if (entry.creation.valid()) {
++      entry.pipeline = entry.creation.get();
++    }
++    if (entry.pipeline != VK_NULL_HANDLE) {
++      vulkan_device->functions().vkDestroyPipeline(vulkan_device->device(), entry.pipeline,
++                                                   nullptr);
+     }
+   }
+-  REXGPU_INFO("[gpu-memexport] compute version of VS {:016X}: {}", vertex_shader.ucode_data_hash(),
+-              pipeline != VK_NULL_HANDLE ? "created" : "FAILED");
+-  memexport_compute_pipelines_.emplace(key, pipeline);
+-  return pipeline;
++  memexport_compute_pipelines_.clear();
+ }
+ 
+ bool VulkanCommandProcessor::InPassVertexShaderMemoryBarrier() {
+@@ -5356,10 +5393,15 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+       ++GetGpuFrameStats().memexport_hoist_blocked_no_pass;
+     }
+     if (compute_pipeline != VK_NULL_HANDLE) {
++      // Workgroups of kMemExportComputeGroupSize invocations along X, rows of
++      // kMemExportComputeDispatchX workgroups along Y.
++      uint32_t group_total =
++          (memexport_hoist_vertex_count + SpirvShaderTranslator::kMemExportComputeGroupSize - 1) /
++          SpirvShaderTranslator::kMemExportComputeGroupSize;
+       uint32_t group_count_x =
+-          std::min(memexport_hoist_vertex_count, SpirvShaderTranslator::kMemExportComputeDispatchX);
++          std::min(group_total, SpirvShaderTranslator::kMemExportComputeDispatchX);
+       uint32_t group_count_y =
+-          (memexport_hoist_vertex_count + SpirvShaderTranslator::kMemExportComputeDispatchX - 1) /
++          (group_total + SpirvShaderTranslator::kMemExportComputeDispatchX - 1) /
+           SpirvShaderTranslator::kMemExportComputeDispatchX;
+       // Vertex textures (if any) are bound for the draw already - textures
+       // that needed loading would have ended the pass above.
+-- 
+2.43.0
+

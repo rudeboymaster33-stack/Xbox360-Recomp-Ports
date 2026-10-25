@@ -1,0 +1,56 @@
+From 1343f94b5c22508f75d4f0bdc8455958fe72a875 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 24 Oct 2026 19:33:31 -0400
+Subject: [PATCH] MMIO fault path: try the write-watch callback before
+ QueryProtect (which parses /proc/self/maps on Linux)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01JJM25S15YdvewrFFwP8g6Z
+---
+ src/system/mmio_handler.cpp | 22 ++++++++++++++--------
+ 1 file changed, 14 insertions(+), 8 deletions(-)
+
+diff --git a/src/system/mmio_handler.cpp b/src/system/mmio_handler.cpp
+index b2058b1..bd9f76d 100644
+--- a/src/system/mmio_handler.cpp
++++ b/src/system/mmio_handler.cpp
+@@ -435,6 +435,18 @@ bool MMIOHandler::ExceptionCallback(arch::Exception* ex) {
+     // clears the watch we just hit).
+     // Do this under the lock so we don't introduce another race condition.
+     auto lock = global_critical_region_.Acquire();
++    // QueryProtect parses /proc/self/maps on Linux/Android (a large file) -
++    // doing it on every write-watch fault cost the game's threads milliseconds
++    // per second. Try the watch callback first; only if it finds no watch
++    // (another thread cleared it) check whether the page is accessible again.
++    if (access_violation_callback_) {
++      bool handled = access_violation_callback_(std::move(lock), access_violation_callback_context_,
++                                                fault_host_address, is_write);
++      if (handled) {
++        return true;
++      }
++      lock = global_critical_region_.Acquire();
++    }
+     memory::PageAccess cur_access;
+     size_t page_length = memory::page_size();
+     memory::QueryProtect(fault_host_address, page_length, cur_access);
+@@ -443,15 +455,9 @@ bool MMIOHandler::ExceptionCallback(arch::Exception* ex) {
+       // Another thread has cleared this watch. Abort.
+       return true;
+     }
+-    // The address is not found within any range, so either a write watch or an
+-    // actual access violation.
++    // The address is not found within any range, so an actual access violation.
+     if (access_violation_callback_) {
+-      bool handled = access_violation_callback_(std::move(lock), access_violation_callback_context_,
+-                                                fault_host_address, is_write);
+-      if (!handled) {
+-        ReportUnhandledAccess(ex, fault_guest_virtual_address, is_write);
+-      }
+-      return handled;
++      ReportUnhandledAccess(ex, fault_guest_virtual_address, is_write);
+     }
+     return false;
+   }
+-- 
+2.43.0
+

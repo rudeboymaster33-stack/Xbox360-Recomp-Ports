@@ -1,0 +1,47 @@
+From 3885542547e3e3522fc26578121a22e94940a668 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 24 Oct 2026 20:39:31 -0400
+Subject: [PATCH] XMPGetPlaybackController: only throttle tight loops (Halo 3
+ calls it once per frame; the 10 ms sleep threw off its timing - vehicles
+ jerked when turning)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01JJM25S15YdvewrFFwP8g6Z
+---
+ src/kernel/xam/apps/xmp_app.cpp | 13 +++++++++++--
+ 1 file changed, 11 insertions(+), 2 deletions(-)
+
+diff --git a/src/kernel/xam/apps/xmp_app.cpp b/src/kernel/xam/apps/xmp_app.cpp
+index a5e9088..bd43864 100644
+--- a/src/kernel/xam/apps/xmp_app.cpp
++++ b/src/kernel/xam/apps/xmp_app.cpp
+@@ -10,6 +10,7 @@
+  */
+ 
+ #include <rex/kernel/xam/apps/xmp_app.h>
++#include <rex/chrono/clock.h>
+ #include <rex/logging.h>
+ #include <rex/system/xthread.h>
+ #include <rex/thread.h>
+@@ -409,8 +410,16 @@ X_HRESULT XmpApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
+       memory::store_and_swap<uint32_t>(memory_->TranslateVirtual(args->locked_ptr), 0);
+ 
+       if (!XThread::GetCurrentThread()->main_thread()) {
+-        // Atrain spawns a thread 82437FD0 to call this in a tight loop forever.
+-        rex::thread::Sleep(std::chrono::milliseconds(10));
++        // Atrain spawns a thread 82437FD0 to call this in a tight loop forever,
++        // so throttle tight loops only. Halo 3 calls it once per frame from
++        // its game thread, and an unconditional 10 ms sleep there threw off
++        // the game's timing (vehicles jerked against the camera when turning).
++        thread_local uint64_t last_call_ms = 0;
++        const uint64_t now_ms = rex::chrono::Clock::QueryHostUptimeMillis();
++        if (now_ms - last_call_ms < 2) {
++          rex::thread::Sleep(std::chrono::milliseconds(10));
++        }
++        last_call_ms = rex::chrono::Clock::QueryHostUptimeMillis();
+       }
+ 
+       return X_E_SUCCESS;
+-- 
+2.43.0
+

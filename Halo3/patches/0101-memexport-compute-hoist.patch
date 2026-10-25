@@ -1,0 +1,454 @@
+From e4cb7af19d42ebed4a4a414738be1a1fd22fe0a0 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 24 Oct 2026 11:37:36 -0400
+Subject: [PATCH] vulkan_memexport_compute_hoist: run memexport-only vertex
+ draws (GPU particle updates) as compute dispatches replayed at the render
+ pass hoist point instead of splitting the pass; memexport compute translation
+ skips the position output
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01JJM25S15YdvewrFFwP8g6Z
+---
+ .../rex/graphics/vulkan/command_processor.h   |   7 +
+ .../graphics/vulkan/deferred_command_buffer.h |  43 +++++-
+ include/rex/graphics/vulkan/shared_memory.h   |  20 +++
+ .../pipeline/shader/spirv_translator.cpp      |  11 +-
+ src/graphics/vulkan/command_processor.cpp     | 128 +++++++++++++++++-
+ .../vulkan/deferred_command_buffer.cpp        |  76 +++++++----
+ src/graphics/vulkan/gpu_frame_stats.h         |   3 +-
+ 7 files changed, 251 insertions(+), 37 deletions(-)
+
+diff --git a/include/rex/graphics/vulkan/command_processor.h b/include/rex/graphics/vulkan/command_processor.h
+index e2c0d8b..b62c674 100644
+--- a/include/rex/graphics/vulkan/command_processor.h
++++ b/include/rex/graphics/vulkan/command_processor.h
+@@ -816,6 +816,13 @@ class VulkanCommandProcessor : public CommandProcessor {
+   const VulkanRenderTargetCache::Framebuffer* current_framebuffer_;
+   bool in_render_pass_ = false;
+   bool pass_allows_vertex_barrier_ = false;
++  // A memexport draw was recorded inline in the current pass since its hoist
++  // point - later memexport work can't be moved before it.
++  bool scope_inline_memexport_ = false;
++  std::unordered_map<uint64_t, VkPipeline> memexport_compute_pipelines_;
++  VkPipeline GetMemExportComputePipeline(VulkanShader& vertex_shader,
++                                         SpirvShaderTranslator::Modification graphics_modification,
++                                         VkPipelineLayout pipeline_layout);
+   // Render area tightening for tile-based GPUs: guest draws record their
+   // scissor; when the pass ends, the recorded begin-rendering render area is
+   // shrunk to the union, so the GPU loads/stores only that part.
+diff --git a/include/rex/graphics/vulkan/deferred_command_buffer.h b/include/rex/graphics/vulkan/deferred_command_buffer.h
+index 2016663..28d2389 100644
+--- a/include/rex/graphics/vulkan/deferred_command_buffer.h
++++ b/include/rex/graphics/vulkan/deferred_command_buffer.h
+@@ -288,9 +288,34 @@ class DeferredCommandBuffer {
+     }
+     HoistBatch& batch = hoist_batches_[hoist_index];
+     for (uint32_t i = 0; i < region_count; ++i) {
+-      batch.copies.push_back({src_buffer, dst_buffer, regions[i]});
++      HoistedItem item = {};
++      item.copy = {src_buffer, dst_buffer, regions[i]};
++      batch.items.push_back(item);
+     }
+   }
++  // A compute dispatch replayed at the hoist point, in order with the hoisted
++  // copies (memory export from vertex shaders converted to compute shaders).
++  void AddHoistedDispatch(uint32_t hoist_index, VkPipeline pipeline, VkPipelineLayout layout,
++                          uint32_t first_set, uint32_t set_count, const VkDescriptorSet* sets,
++                          uint32_t group_count_x, uint32_t group_count_y,
++                          uint32_t group_count_z) {
++    if (hoist_index >= hoist_batches_.size() || set_count > kHoistedDispatchMaxSets) {
++      return;
++    }
++    HoistedItem item = {};
++    item.is_dispatch = true;
++    item.dispatch.pipeline = pipeline;
++    item.dispatch.layout = layout;
++    item.dispatch.first_set = first_set;
++    item.dispatch.set_count = set_count;
++    for (uint32_t i = 0; i < set_count; ++i) {
++      item.dispatch.sets[i] = sets[i];
++    }
++    item.dispatch.group_count[0] = group_count_x;
++    item.dispatch.group_count[1] = group_count_y;
++    item.dispatch.group_count[2] = group_count_z;
++    hoist_batches_[hoist_index].items.push_back(item);
++  }
+ 
+   void CmdVkWriteTimestamp(VkPipelineStageFlagBits stage, VkQueryPool query_pool, uint32_t query) {
+     auto& args = *reinterpret_cast<ArgsVkWriteTimestamp*>(
+@@ -636,8 +661,22 @@ class DeferredCommandBuffer {
+     VkBuffer dst;
+     VkBufferCopy region;
+   };
++  static constexpr uint32_t kHoistedDispatchMaxSets = 4;
++  struct HoistedDispatch {
++    VkPipeline pipeline;
++    VkPipelineLayout layout;
++    uint32_t first_set;
++    uint32_t set_count;
++    VkDescriptorSet sets[kHoistedDispatchMaxSets];
++    uint32_t group_count[3];
++  };
++  struct HoistedItem {
++    bool is_dispatch;
++    HoistedCopy copy;
++    HoistedDispatch dispatch;
++  };
+   struct HoistBatch {
+-    std::vector<HoistedCopy> copies;
++    std::vector<HoistedItem> items;
+   };
+   std::vector<HoistBatch> hoist_batches_;
+ };
+diff --git a/include/rex/graphics/vulkan/shared_memory.h b/include/rex/graphics/vulkan/shared_memory.h
+index df8c6ed..dfeaa37 100644
+--- a/include/rex/graphics/vulkan/shared_memory.h
++++ b/include/rex/graphics/vulkan/shared_memory.h
+@@ -69,6 +69,26 @@ class VulkanSharedMemory : public SharedMemory {
+   }
+   void NoteDrawRead(uint32_t start, uint32_t length);
+   void CommitDrawReads();
++  // Drops the reads collected for the draw being prepared (when its work is
++  // moved to the hoist point instead of being recorded in the pass).
++  void DiscardDrawReads() {
++    draw_reads_.clear();
++    draw_reads_saturated_ = false;
++  }
++  // Whether draws recorded in the pass since the hoist point have read any
++  // byte of [start, start + length).
++  bool ScopeReadsOverlapBytes(uint32_t start, uint32_t length) const {
++    if (scope_saturated_) {
++      return true;
++    }
++    uint64_t end = uint64_t(start) + length;
++    for (const std::pair<uint32_t, uint32_t>& read : scope_reads_) {
++      if (uint64_t(read.first) < end && uint64_t(start) < uint64_t(read.second)) {
++        return true;
++      }
++    }
++    return false;
++  }
+ 
+  protected:
+   bool AllocateSparseHostGpuMemoryRange(uint32_t offset_allocations,
+diff --git a/src/graphics/pipeline/shader/spirv_translator.cpp b/src/graphics/pipeline/shader/spirv_translator.cpp
+index 567c641..5235205 100644
+--- a/src/graphics/pipeline/shader/spirv_translator.cpp
++++ b/src/graphics/pipeline/shader/spirv_translator.cpp
+@@ -4102,10 +4102,13 @@ void SpirvShaderTranslator::StoreResult(const InstructionResult& result, spv::Id
+     } break;
+     case InstructionStorageTarget::kPosition: {
+       assert_true(is_vertex_shader());
+-      id_vector_temp_util_.clear();
+-      id_vector_temp_util_.push_back(builder_->makeIntConstant(kOutputPerVertexMemberPosition));
+-      target_pointer = builder_->createAccessChain(spv::StorageClassOutput, output_per_vertex_,
+-                                                   id_vector_temp_util_);
++      // No position output in the memory export compute shader.
++      if (output_per_vertex_ != spv::NoResult) {
++        id_vector_temp_util_.clear();
++        id_vector_temp_util_.push_back(builder_->makeIntConstant(kOutputPerVertexMemberPosition));
++        target_pointer = builder_->createAccessChain(spv::StorageClassOutput, output_per_vertex_,
++                                                     id_vector_temp_util_);
++      }
+     } break;
+     case InstructionStorageTarget::kPointSizeEdgeFlagKillVertex: {
+       assert_true(is_vertex_shader());
+diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
+index 0ab9acf..857278c 100644
+--- a/src/graphics/vulkan/command_processor.cpp
++++ b/src/graphics/vulkan/command_processor.cpp
+@@ -72,6 +72,10 @@ REXCVAR_DEFINE_BOOL(vulkan_submit_on_primary_buffer_end, true, "GPU/Vulkan",
+                     "Submit command buffer when PM4 primary buffer ends")
+     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+ 
++REXCVAR_DEFINE_BOOL(vulkan_memexport_compute_hoist, false, "GPU/Vulkan",
++                    "Run memory-export-only vertex shader draws (GPU particle updates) as "
++                    "compute dispatches moved to before the open render pass, instead of "
++                    "ending the pass for their barriers");
+ REXCVAR_DEFINE_BOOL(vulkan_memexport_barrier_in_pass, false, "GPU/Vulkan",
+                     "Keep the render pass open across barriers for memory exported by vertex "
+                     "shaders (GPU particles) using render pass self-dependencies; needs "
+@@ -895,7 +899,8 @@ bool VulkanCommandProcessor::SetupContext() {
+     guest_shader_vertex_stages_ |=
+         VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT | VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT;
+   }
+-  if (!device_properties.vertexPipelineStoresAndAtomics) {
++  if (!device_properties.vertexPipelineStoresAndAtomics ||
++      REXCVAR_GET(vulkan_memexport_compute_hoist)) {
+     // For memory export from vertex shaders converted to compute shaders.
+     guest_shader_pipeline_stages_ |= VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+     guest_shader_vertex_stages_ |= VK_SHADER_STAGE_COMPUTE_BIT;
+@@ -2678,9 +2683,10 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
+       }
+       REXGPU_INFO(
+           "[gpu-hoist] per frame: uploads_moved_before_pass={:.1f} uploads_kept={:.1f} "
+-          "shm_barriers_in_pass={:.1f} memexport_barriers_deferred={:.1f} memexport_barriers_kept_in_pass={:.1f}",
++          "shm_barriers_in_pass={:.1f} memexport_barriers_deferred={:.1f} memexport_barriers_kept_in_pass={:.1f} memexport_compute_hoisted={:.1f}",
+           st.shm_hoisted / f, st.shm_hoist_blocked / f, st.shm_use_barriers_in_pass / f,
+-          st.shm_memexport_deferred / f, st.shm_memexport_in_pass_barriers / f);
++          st.shm_memexport_deferred / f, st.shm_memexport_in_pass_barriers / f,
++          st.memexport_compute_hoisted / f);
+       REXGPU_INFO(
+           "[gpu-query] per frame: queries={:.1f} draws_in_queries={:.1f} skipped={:.1f} "
+           "kept_zwrite={:.1f} kept_color={:.1f} kept_other={:.1f}",
+@@ -3568,6 +3574,7 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
+ 
+   current_render_pass_ = use_dynamic_rendering ? VK_NULL_HANDLE : render_pass;
+   current_framebuffer_ = framebuffer;
++  scope_inline_memexport_ = false;
+   pass_allows_vertex_barrier_ =
+       !use_dynamic_rendering && REXCVAR_GET(vulkan_memexport_barrier_in_pass) &&
+       render_target_cache_->last_update_render_pass_key().depth_and_color_used != 0;
+@@ -4196,6 +4203,49 @@ void VulkanCommandProcessor::LogPassBreakPushers(double frames) {
+   std::fill(std::begin(break_pusher_image_), std::end(break_pusher_image_), 0u);
+ }
+ 
++VkPipeline VulkanCommandProcessor::GetMemExportComputePipeline(
++    VulkanShader& vertex_shader, SpirvShaderTranslator::Modification graphics_modification,
++    VkPipelineLayout pipeline_layout) {
++  SpirvShaderTranslator::Modification modification = graphics_modification;
++  modification.vertex.host_vertex_shader_type = Shader::HostVertexShaderType::kMemExportCompute;
++  modification.vertex.interpolator_mask = 0;
++  modification.vertex.output_point_parameters = 0;
++  modification.vertex.user_clip_plane_count = 0;
++  modification.vertex.user_clip_plane_cull = 0;
++  modification.vertex.vertex_kill_and = 0;
++  auto translation = static_cast<VulkanShader::VulkanTranslation*>(
++      vertex_shader.GetOrCreateTranslation(modification.value));
++  uint64_t key = uint64_t(reinterpret_cast<uintptr_t>(translation)) * 0x9E3779B97F4A7C15ull ^
++                 uint64_t(reinterpret_cast<uintptr_t>(pipeline_layout));
++  auto it = memexport_compute_pipelines_.find(key);
++  if (it != memexport_compute_pipelines_.end()) {
++    return it->second;
++  }
++  VkPipeline pipeline = VK_NULL_HANDLE;
++  if (pipeline_cache_->EnsureShadersTranslated(translation, nullptr)) {
++    VkShaderModule shader_module = translation->GetOrCreateShaderModule();
++    if (shader_module != VK_NULL_HANDLE) {
++      VkComputePipelineCreateInfo create_info = {};
++      create_info.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
++      create_info.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
++      create_info.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
++      create_info.stage.module = shader_module;
++      create_info.stage.pName = "main";
++      create_info.layout = pipeline_layout;
++      const ui::vulkan::VulkanDevice* vulkan_device = GetVulkanDevice();
++      if (vulkan_device->functions().vkCreateComputePipelines(
++              vulkan_device->device(), VK_NULL_HANDLE, 1, &create_info, nullptr, &pipeline) !=
++          VK_SUCCESS) {
++        pipeline = VK_NULL_HANDLE;
++      }
++    }
++  }
++  REXGPU_INFO("[gpu-memexport] compute version of VS {:016X}: {}", vertex_shader.ucode_data_hash(),
++              pipeline != VK_NULL_HANDLE ? "created" : "FAILED");
++  memexport_compute_pipelines_.emplace(key, pipeline);
++  return pipeline;
++}
++
+ bool VulkanCommandProcessor::InPassVertexShaderMemoryBarrier() {
+   if (!in_render_pass_ || !pass_allows_vertex_barrier_ ||
+       current_render_pass_ == VK_NULL_HANDLE) {
+@@ -5154,10 +5204,42 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+     }
+   }
+ 
++  // Memory-export-only draws (GPU particle updates) as compute dispatches
++  // moved to the hoist point of the open render pass.
++  bool memexport_compute_hoist = false;
++  uint32_t memexport_hoist_index = 0;
++  uint32_t memexport_hoist_vertex_count = 0;
++  if (REXCVAR_GET(vulkan_memexport_compute_hoist) && memexport_used_vertex &&
++      !memexport_used_pixel && !pixel_shader && !is_rasterization_done &&
++      !memexport_ranges_.empty() &&
++      primitive_processing_result.host_vertex_shader_type ==
++          Shader::HostVertexShaderType::kVertex &&
++      (primitive_processing_result.index_buffer_type ==
++           PrimitiveProcessor::ProcessedIndexBufferType::kNone ||
++       primitive_processing_result.index_buffer_type ==
++           PrimitiveProcessor::ProcessedIndexBufferType::kGuestDMA) &&
++      !vertex_shader->GetUsedTextureMaskAfterTranslation() && !scope_inline_memexport_ &&
++      GetDrawPassHoistPoint(memexport_hoist_index)) {
++    memexport_compute_hoist = true;
++    for (const draw_util::MemExportRange& range : memexport_ranges_) {
++      if (shared_memory_->ScopeReadsOverlapBytes(range.base_address_dwords << 2,
++                                                 range.size_bytes)) {
++        memexport_compute_hoist = false;
++        break;
++      }
++    }
++    memexport_hoist_vertex_count = primitive_processing_result.guest_draw_vertex_count;
++    if (!memexport_hoist_vertex_count) {
++      memexport_compute_hoist = false;
++    }
++  }
++
+   // Update system constants before uploading them.
+   UpdateSystemConstantValues(primitive_polygonal, primitive_processing_result,
+-                             shader_32bit_index_dma, 0, viewport_info, used_texture_mask,
+-                             normalized_depth_control, normalized_color_mask);
++                             shader_32bit_index_dma,
++                             memexport_compute_hoist ? memexport_hoist_vertex_count : 0,
++                             viewport_info, used_texture_mask, normalized_depth_control,
++                             normalized_color_mask);
+ 
+   // Update uniform buffers and descriptor sets after binding the pipeline with
+   // the new layout.
+@@ -5245,6 +5327,42 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+     }
+   }
+ 
++  if (memexport_compute_hoist) {
++    // Requesting the ranges above may have ended the pass (uploads that
++    // couldn't be hoisted) - only use the same hoist point.
++    uint32_t hoist_index_now;
++    VkPipeline compute_pipeline = VK_NULL_HANDLE;
++    if (GetDrawPassHoistPoint(hoist_index_now) && hoist_index_now == memexport_hoist_index) {
++      compute_pipeline = GetMemExportComputePipeline(
++          *vertex_shader, vertex_shader_modification,
++          current_guest_graphics_pipeline_layout_->GetPipelineLayout());
++    }
++    if (compute_pipeline != VK_NULL_HANDLE) {
++      uint32_t group_count_x =
++          std::min(memexport_hoist_vertex_count, SpirvShaderTranslator::kMemExportComputeDispatchX);
++      uint32_t group_count_y =
++          (memexport_hoist_vertex_count + SpirvShaderTranslator::kMemExportComputeDispatchX - 1) /
++          SpirvShaderTranslator::kMemExportComputeDispatchX;
++      deferred_command_buffer_.AddHoistedDispatch(
++          memexport_hoist_index, compute_pipeline,
++          current_guest_graphics_pipeline_layout_->GetPipelineLayout(), 0,
++          uint32_t(SpirvShaderTranslator::kDescriptorSetConstants) + 1,
++          current_graphics_descriptor_sets_, group_count_x, group_count_y, 1);
++      // The replay binds a compute pipeline before anything recorded later.
++      current_external_compute_pipeline_ = VK_NULL_HANDLE;
++      shared_memory_->DiscardDrawReads();
++      for (const draw_util::MemExportRange& memexport_range : memexport_ranges_) {
++        shared_memory_->RangeWrittenByGpu(memexport_range.base_address_dwords << 2,
++                                          memexport_range.size_bytes);
++      }
++      ++GetGpuFrameStats().memexport_compute_hoisted;
++      return true;
++    }
++  }
++  if (memexport_writes_possible) {
++    scope_inline_memexport_ = true;
++  }
++
+   ScratchBufferAcquisition guest_dma_index_scratch_buffer;
+   if (primitive_processing_result.index_buffer_type ==
+           PrimitiveProcessor::ProcessedIndexBufferType::kGuestDMA &&
+diff --git a/src/graphics/vulkan/deferred_command_buffer.cpp b/src/graphics/vulkan/deferred_command_buffer.cpp
+index 9d92c48..653a26e 100644
+--- a/src/graphics/vulkan/deferred_command_buffer.cpp
++++ b/src/graphics/vulkan/deferred_command_buffer.cpp
+@@ -269,42 +269,68 @@ void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {
+ 
+       case Command::kHoistPoint: {
+         auto& args = *reinterpret_cast<const ArgsHoistPoint*>(stream);
+-        if (args.index < hoist_batches_.size() && !hoist_batches_[args.index].copies.empty()) {
++        if (args.index < hoist_batches_.size() && !hoist_batches_[args.index].items.empty()) {
+           const HoistBatch& batch = hoist_batches_[args.index];
+-          // Earlier reads and writes of the destination must be done before
+-          // the copies overwrite it.
+-          VkMemoryBarrier before;
+-          before.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+-          before.pNext = nullptr;
+-          before.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+-          before.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+-          dfn.vkCmdPipelineBarrier(command_buffer, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+-                                   VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &before, 0, nullptr, 0,
+-                                   nullptr);
++          VkPipelineStageFlags written_stages = 0;
++          VkAccessFlags written_access = 0;
+           size_t i = 0;
+-          while (i < batch.copies.size()) {
+-            size_t j = i;
+-            VkBufferCopy regions[64];
+-            uint32_t region_count = 0;
+-            while (j < batch.copies.size() && region_count < 64 &&
+-                   batch.copies[j].src == batch.copies[i].src &&
+-                   batch.copies[j].dst == batch.copies[i].dst) {
+-              regions[region_count++] = batch.copies[j].region;
+-              ++j;
++          while (i < batch.items.size()) {
++            const HoistedItem& item = batch.items[i];
++            // Earlier reads and writes (before the hoist point, and earlier
++            // hoisted items) must be done before this item writes or reads.
++            VkMemoryBarrier before;
++            before.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
++            before.pNext = nullptr;
++            before.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
++            if (item.is_dispatch) {
++              before.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT |
++                                     VK_ACCESS_UNIFORM_READ_BIT;
++              dfn.vkCmdPipelineBarrier(command_buffer, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
++                                       VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &before, 0,
++                                       nullptr, 0, nullptr);
++              const HoistedDispatch& d = item.dispatch;
++              dfn.vkCmdBindPipeline(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, d.pipeline);
++              dfn.vkCmdBindDescriptorSets(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
++                                          d.layout, d.first_set, d.set_count, d.sets, 0,
++                                          nullptr);
++              dfn.vkCmdDispatch(command_buffer, d.group_count[0], d.group_count[1],
++                                d.group_count[2]);
++              written_stages |= VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
++              written_access |= VK_ACCESS_SHADER_WRITE_BIT;
++              ++i;
++              continue;
+             }
+-            dfn.vkCmdCopyBuffer(command_buffer, batch.copies[i].src, batch.copies[i].dst,
+-                                region_count, regions);
+-            i = j;
++            before.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
++            dfn.vkCmdPipelineBarrier(command_buffer, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
++                                     VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &before, 0, nullptr,
++                                     0, nullptr);
++            // Consecutive copies with the same buffers in one call.
++            while (i < batch.items.size() && !batch.items[i].is_dispatch) {
++              size_t j = i;
++              VkBufferCopy regions[64];
++              uint32_t region_count = 0;
++              while (j < batch.items.size() && !batch.items[j].is_dispatch &&
++                     region_count < 64 && batch.items[j].copy.src == batch.items[i].copy.src &&
++                     batch.items[j].copy.dst == batch.items[i].copy.dst) {
++                regions[region_count++] = batch.items[j].copy.region;
++                ++j;
++              }
++              dfn.vkCmdCopyBuffer(command_buffer, batch.items[i].copy.src,
++                                  batch.items[i].copy.dst, region_count, regions);
++              i = j;
++            }
++            written_stages |= VK_PIPELINE_STAGE_TRANSFER_BIT;
++            written_access |= VK_ACCESS_TRANSFER_WRITE_BIT;
+           }
+           VkMemoryBarrier after;
+           after.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+           after.pNext = nullptr;
+-          after.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
++          after.srcAccessMask = written_access;
+           after.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_SHADER_READ_BIT |
+                                 VK_ACCESS_INDEX_READ_BIT | VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT |
+                                 VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT |
+                                 VK_ACCESS_TRANSFER_WRITE_BIT;
+-          dfn.vkCmdPipelineBarrier(command_buffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
++          dfn.vkCmdPipelineBarrier(command_buffer, written_stages,
+                                    VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &after, 0, nullptr,
+                                    0, nullptr);
+         }
+diff --git a/src/graphics/vulkan/gpu_frame_stats.h b/src/graphics/vulkan/gpu_frame_stats.h
+index 1aeb547..c629d3f 100644
+--- a/src/graphics/vulkan/gpu_frame_stats.h
++++ b/src/graphics/vulkan/gpu_frame_stats.h
+@@ -32,7 +32,8 @@ struct GpuFrameStats {
+   uint64_t shm_hoisted = 0;        // uploads moved to before the render pass
+   uint64_t shm_hoist_blocked = 0;
+   uint64_t shm_use_barriers_in_pass = 0;   // shared memory barriers while a draw pass is open
+-  uint64_t shm_memexport_in_pass_barriers = 0;  // memexport barriers kept inside the pass
++  uint64_t shm_memexport_in_pass_barriers = 0;
++  uint64_t memexport_compute_hoisted = 0;  // particle updates run as hoisted compute  // memexport barriers kept inside the pass
+   uint64_t shm_memexport_deferred = 0;     // memexport barriers deferred (no overlapping read)  // uploads in a draw pass that could not be moved
+   uint64_t queries = 0;              // guest occlusion queries begun
+   uint64_t query_draws = 0;          // draws issued while a guest query was open
+-- 
+2.43.0
+

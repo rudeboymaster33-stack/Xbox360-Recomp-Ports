@@ -1,0 +1,68 @@
+From 98b3d6d14970999b669e0f5ea0c1271eb0577b6f Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 24 Oct 2026 17:27:46 -0400
+Subject: [PATCH] [ui-loop] UI thread event statistics
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01JJM25S15YdvewrFFwP8g6Z
+---
+ src/ui/windowed_app_context_sdl.cpp | 29 +++++++++++++++++++++++++++++
+ 1 file changed, 29 insertions(+)
+
+diff --git a/src/ui/windowed_app_context_sdl.cpp b/src/ui/windowed_app_context_sdl.cpp
+index 36307e4..9060d26 100644
+--- a/src/ui/windowed_app_context_sdl.cpp
++++ b/src/ui/windowed_app_context_sdl.cpp
+@@ -9,6 +9,9 @@
+  *              See LICENSE file in the project root for full license text.
+  */
+ 
++#include <chrono>
++#include <unordered_map>
++#include <fmt/format.h>
+ #include <rex/ui/windowed_app_context_sdl.h>
+ 
+ #include <cstdlib>
+@@ -85,13 +88,39 @@ void SDLWindowedAppContext::PlatformQuitFromUIThread() {
+ }
+ 
+ int SDLWindowedAppContext::RunMainMessageLoop() {
++  // [ui-loop] statistics: events per type and time spent, every 5 s.
++  std::unordered_map<uint32_t, std::pair<uint32_t, double>> event_stats;
++  uint32_t loop_count = 0;
++  double wait_ms = 0.0;
++  auto window_start = std::chrono::steady_clock::now();
+   while (!HasQuitFromUIThread()) {
+     SDL_Event event;
++    auto wait_start = std::chrono::steady_clock::now();
+     if (!SDL_WaitEvent(&event)) {
+       REXLOG_ERROR("SDL_WaitEvent failed: {}", SDL_GetError());
+       return EXIT_FAILURE;
+     }
++    auto process_start = std::chrono::steady_clock::now();
++    wait_ms += std::chrono::duration<double, std::milli>(process_start - wait_start).count();
+     ProcessEvent(event);
++    auto& stat = event_stats[event.type];
++    ++stat.first;
++    stat.second += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
++                                                             process_start)
++                       .count();
++    ++loop_count;
++    if (std::chrono::steady_clock::now() - window_start > std::chrono::seconds(5)) {
++      std::string text;
++      for (const auto& [type, counts] : event_stats) {
++        text += fmt::format(" {:X}:{}/{:.0f}ms", type, counts.first, counts.second);
++      }
++      REXLOG_INFO("[ui-loop] 5 s: {} events, {:.0f} ms in SDL_WaitEvent; per type (count/ms):{}",
++                  loop_count, wait_ms, text);
++      event_stats.clear();
++      loop_count = 0;
++      wait_ms = 0.0;
++      window_start = std::chrono::steady_clock::now();
++    }
+   }
+   return EXIT_SUCCESS;
+ }
+-- 
+2.43.0
+

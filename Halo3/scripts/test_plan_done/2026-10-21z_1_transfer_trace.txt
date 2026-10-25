@@ -1,2 +1,0 @@
-#wait=65
---vulkan_gpu_timestamps=true

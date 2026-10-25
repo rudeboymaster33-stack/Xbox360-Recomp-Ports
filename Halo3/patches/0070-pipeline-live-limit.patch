@@ -1,0 +1,171 @@
+From ee92c86af259afa3311e5c6bd6234cffa4d0380c Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 22 Oct 2026 21:30:45 -0400
+Subject: [PATCH] vulkan: vulkan_pipeline_live_limit (evict least recently used
+ pipelines) and vulkan_pipeline_preload_limit - Adreno takes ~10 MB of GPU
+ memory per pipeline
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01JJM25S15YdvewrFFwP8g6Z
+---
+ include/rex/graphics/vulkan/pipeline_cache.h | 11 ++-
+ src/graphics/vulkan/pipeline_cache.cpp       | 72 ++++++++++++++++++++
+ 2 files changed, 82 insertions(+), 1 deletion(-)
+
+diff --git a/include/rex/graphics/vulkan/pipeline_cache.h b/include/rex/graphics/vulkan/pipeline_cache.h
+index 7b938b9..ba73765 100644
+--- a/include/rex/graphics/vulkan/pipeline_cache.h
++++ b/include/rex/graphics/vulkan/pipeline_cache.h
+@@ -238,13 +238,16 @@ class VulkanPipelineCache {
+     // destroyed by it while the pipeline cache is active.
+     std::atomic<const PipelineLayoutProvider*> pipeline_layout{nullptr};
+     std::atomic<bool> is_placeholder{false};
++    // Submission that last used the pipeline (for vulkan_pipeline_live_limit).
++    mutable std::atomic<uint64_t> last_used_submission{0};
+     Pipeline() = default;
+     Pipeline(const PipelineLayoutProvider* pipeline_layout_provider)
+         : pipeline_layout(pipeline_layout_provider) {}
+     Pipeline(const Pipeline& other)
+         : pipeline(other.pipeline.load(std::memory_order_acquire)),
+           pipeline_layout(other.pipeline_layout.load(std::memory_order_acquire)),
+-          is_placeholder(other.is_placeholder.load(std::memory_order_acquire)) {}
++          is_placeholder(other.is_placeholder.load(std::memory_order_acquire)),
++          last_used_submission(other.last_used_submission.load(std::memory_order_relaxed)) {}
+     Pipeline& operator=(const Pipeline& other) {
+       if (this == &other) {
+         return *this;
+@@ -370,6 +373,12 @@ class VulkanPipelineCache {
+   void CreationThread(size_t thread_index);
+   void CreateQueuedPipelinesOnProcessorThread();
+   void ProcessDeferredPipelineDestructions(bool force_all);
++  // Destroys the least recently used pipelines above vulkan_pipeline_live_limit
++  // (they are recreated on demand).
++  void EvictPipelinesOverLimit();
++  uint64_t pipeline_eviction_check_counter_ = 0;
++  uint64_t pipelines_evicted_ = 0;
++  uint64_t pipelines_recreated_ = 0;
+ 
+   VulkanCommandProcessor& command_processor_;
+   const RegisterFile& register_file_;
+diff --git a/src/graphics/vulkan/pipeline_cache.cpp b/src/graphics/vulkan/pipeline_cache.cpp
+index 73dde5f..e93c9ea 100644
+--- a/src/graphics/vulkan/pipeline_cache.cpp
++++ b/src/graphics/vulkan/pipeline_cache.cpp
+@@ -55,6 +55,13 @@ REXCVAR_DEFINE_INT32(
+     .range(-1, 32)
+     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+ 
++REXCVAR_DEFINE_INT32(vulkan_pipeline_live_limit, 0, "GPU/Vulkan",
++                     "Keep at most this many graphics pipelines alive, destroying the least "
++                     "recently used ones (recreated when needed again). Each pipeline can take "
++                     "about 10 MB of GPU memory on Adreno. 0 = no limit");
++REXCVAR_DEFINE_INT32(vulkan_pipeline_preload_limit, -1, "GPU/Vulkan",
++                     "Create at most this many pipelines from the pipeline storage at startup "
++                     "(the rest are created when first needed). -1 = all");
+ REXCVAR_DEFINE_BOOL(vulkan_tessellation_wireframe, false, "GPU/Vulkan",
+                     "Render tessellation as wireframe")
+     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+@@ -624,6 +631,11 @@ void VulkanPipelineCache::InitializeShaderStorage(const std::filesystem::path& c
+                                    : pipeline_description.depth_write_enable != 0;
+     creation_arguments.priority = pipeline_util::CalculatePipelinePriority(
+         bound_rts, shader_writes_color_targets, shader_writes_depth);
++    if (REXCVAR_GET(vulkan_pipeline_preload_limit) >= 0 &&
++        pipeline_creations.size() >= size_t(REXCVAR_GET(vulkan_pipeline_preload_limit))) {
++      // Keep the description - the pipeline will be created when first used.
++      continue;
++    }
+     pipeline_creations.push_back(creation_arguments);
+   }
+ 
+@@ -795,6 +807,59 @@ void VulkanPipelineCache::EndSubmission() {
+   }
+ 
+   ProcessDeferredPipelineDestructions(false);
++  EvictPipelinesOverLimit();
++}
++
++void VulkanPipelineCache::EvictPipelinesOverLimit() {
++  int32_t limit = REXCVAR_GET(vulkan_pipeline_live_limit);
++  if (limit <= 0 || (++pipeline_eviction_check_counter_ & 15) != 0) {
++    return;
++  }
++  uint64_t completed_submission = command_processor_.GetCompletedSubmission();
++  std::vector<std::pair<uint64_t, std::pair<const PipelineDescription, Pipeline>*>> candidates;
++  size_t live_count = 0;
++  for (auto& pipeline_pair : pipelines_) {
++    if (pipeline_pair.second.pipeline.load(std::memory_order_acquire) == VK_NULL_HANDLE) {
++      continue;
++    }
++    ++live_count;
++    if (pipeline_pair.second.is_placeholder.load(std::memory_order_acquire)) {
++      continue;
++    }
++    uint64_t last_used = pipeline_pair.second.last_used_submission.load(std::memory_order_relaxed);
++    // Only pipelines the GPU is surely done with.
++    if (last_used < completed_submission) {
++      candidates.emplace_back(last_used, &pipeline_pair);
++    }
++  }
++  if (live_count <= size_t(limit)) {
++    return;
++  }
++  // Go a bit below the limit so this doesn't run every check.
++  size_t to_evict = live_count - size_t(limit) + size_t(limit) / 10;
++  to_evict = std::min(to_evict, candidates.size());
++  if (!to_evict) {
++    return;
++  }
++  std::partial_sort(candidates.begin(), candidates.begin() + to_evict, candidates.end(),
++                    [](const auto& a, const auto& b) { return a.first < b.first; });
++  const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
++  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
++  const VkDevice device = vulkan_device->device();
++  for (size_t i = 0; i < to_evict; ++i) {
++    auto* pipeline_pair = candidates[i].second;
++    if (last_pipeline_ == pipeline_pair) {
++      last_pipeline_ = nullptr;
++    }
++    VkPipeline pipeline =
++        pipeline_pair->second.pipeline.exchange(VK_NULL_HANDLE, std::memory_order_acq_rel);
++    if (pipeline != VK_NULL_HANDLE) {
++      dfn.vkDestroyPipeline(device, pipeline, nullptr);
++      ++pipelines_evicted_;
++    }
++  }
++  REXGPU_INFO("[gpu-pipelines] live={} limit={} evicted now={} total evicted={} recreated={}",
++              live_count, limit, to_evict, pipelines_evicted_, pipelines_recreated_);
+ }
+ 
+ void VulkanPipelineCache::Shutdown() {
+@@ -1108,6 +1173,8 @@ bool VulkanPipelineCache::ConfigurePipeline(
+     const PipelineLayoutProvider* last_pipeline_layout =
+         last_pipeline_->second.pipeline_layout.load(std::memory_order_acquire);
+     if (last_pipeline != VK_NULL_HANDLE && last_pipeline_layout != nullptr) {
++      last_pipeline_->second.last_used_submission.store(command_processor_.GetCurrentSubmission(),
++                                                       std::memory_order_relaxed);
+       pipeline_out = last_pipeline;
+       pipeline_layout_out = last_pipeline_layout;
+       if (pipeline_handle_out) {
+@@ -1134,7 +1201,10 @@ bool VulkanPipelineCache::ConfigurePipeline(
+   auto it = pipelines_.find(description);
+   if (it != pipelines_.end()) {
+     VkPipeline found_pipeline = it->second.pipeline.load(std::memory_order_acquire);
++    it->second.last_used_submission.store(command_processor_.GetCurrentSubmission(),
++                                          std::memory_order_relaxed);
+     if (found_pipeline == VK_NULL_HANDLE) {
++      ++pipelines_recreated_;
+       PipelineCreationArguments creation_arguments;
+       if (!TryGetPipelineCreationArgumentsForDescription(description, &*it, creation_arguments) ||
+           !EnsurePipelineCreated(creation_arguments)) {
+@@ -1155,6 +1225,8 @@ bool VulkanPipelineCache::ConfigurePipeline(
+ 
+   // Create the pipeline if not already existing.
+   auto& pipeline = *pipelines_.emplace(description, Pipeline()).first;
++  pipeline.second.last_used_submission.store(command_processor_.GetCurrentSubmission(),
++                                             std::memory_order_relaxed);
+   PipelineCreationArguments creation_arguments_real;
+   if (!TryGetPipelineCreationArgumentsForDescription(description, &pipeline,
+                                                      creation_arguments_real)) {
+-- 
+2.43.0
+

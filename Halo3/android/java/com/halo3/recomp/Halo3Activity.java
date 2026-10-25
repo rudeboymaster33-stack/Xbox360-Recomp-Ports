@@ -1,5 +1,7 @@
 package com.halo3.recomp;
 
+import android.content.Context;
+import android.hardware.Sensor;
 import android.os.Bundle;
 import android.view.WindowManager;
 
@@ -9,6 +11,7 @@ import java.io.FileReader;
 import java.util.ArrayList;
 
 import org.libsdl.app.SDLActivity;
+import org.libsdl.app.SDLSurface;
 
 /**
  * Halo 3 recomp launcher.
@@ -26,6 +29,22 @@ public class Halo3Activity extends SDLActivity {
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+    }
+
+    @Override
+    protected SDLSurface createSDLSurface(Context context) {
+        // SDL listens to the accelerometer all the time (for rotation and an
+        // accelerometer joystick). Each sensor event woke the game's UI thread,
+        // which also puts frames on screen - the game doesn't use it.
+        return new SDLSurface(context) {
+            @Override
+            protected void enableSensor(int sensortype, boolean enabled) {
+                if (sensortype == Sensor.TYPE_ACCELEROMETER) {
+                    return;
+                }
+                super.enableSensor(sensortype, enabled);
+            }
+        };
     }
 
     @Override
@@ -56,6 +75,8 @@ public class Halo3Activity extends SDLActivity {
         // Render without 4x MSAA: about +33% speed on the menu (13.5 -> 18 fps).
         // Known side effect: black boxes for a moment right after skipping the intro.
         args.add("--gpu_force_msaa_1x=true");
+        // Only the menu's 4-strip 3D background (pitch 1160); other MSAA images (loading/Forge) need real MSAA.
+        args.add("--gpu_force_msaa_1x_pitch=1160");
         // Plain multiplies in translated shaders instead of emulating the Xbox 360
         // "0 * anything = 0" rule: about +25% on the menu, no visible difference.
         args.add("--gpu_shader_fast_multiply=true");
@@ -68,12 +89,28 @@ public class Halo3Activity extends SDLActivity {
         args.add("--execute_unclipped_draw_vs_on_cpu=true");
         // Draw the 4 predicated-tiling strips as one full-screen pass (heavy menu view 43 -> ~28 ms GPU).
         args.add("--gpu_collapse_predicated_tiles=true");
+        // Translate shader loops/jumps into structured SPIR-V instead of a program-counter switch:
+        // Adreno gave each switch-based loop pipeline ~24 MB of scratch memory (menu 4.5 GB -> 45 MB).
+        args.add("--gpu_shader_structured_loops=true");
+        // GPU particle updates run as compute work before each render pass instead of
+        // splitting the pass (smooth frame rate during effects; confirmed 2026-10-24).
+        args.add("--vulkan_memexport_compute_hoist=true");
+        // Vertex fetch picks the shared-memory buffer once per element (heavy view -1.3 ms GPU).
+        args.add("--gpu_shader_vfetch_one_switch=true");
+        // 12 audio frames (64 ms) of buffer: no pop at map load (2026-10-24).
+        args.add("--audio_maxqframes=12");
+        // Start each guest frame on an even vblank grid (as on the console):
+        // late frames (>40 ms) dropped from ~95 to ~7 per 300.
+        args.add("--vdswap_min_vblanks=2");
+        args.add("--ui_achievement_toasts=false");
         // Evenly paced frames: FIFO presentation (VK_GOOGLE_display_timing).
         args.add("--vulkan_allow_present_mode_immediate=false");
         args.add("--vulkan_allow_present_mode_mailbox=false");
         args.add("--vulkan_allow_present_mode_fifo_relaxed=false");
-        // AMD FSR 1 upscales the 1280x720 game image to the 1080p screen.
-        args.add("--present_effect=fsr");
+        // AMD CAS upscales and sharpens the 1152x640 game image to the 1080p
+        // screen in one pass: ~0.6 ms of GPU per frame vs ~1.25 ms for FSR 1
+        // (EASU + RCAS), and looked as sharp to the user (2026-10-24).
+        args.add("--present_effect=cas");
         args.add("--game_data_root=" + b + "/game");
         args.add("--user_data_root=" + b + "/userdata");
         args.add("--log_file=" + b + "/halo3.log");
@@ -111,7 +148,13 @@ public class Halo3Activity extends SDLActivity {
                 while ((line = r.readLine()) != null) {
                     line = line.trim();
                     if (!line.isEmpty() && !line.startsWith("#")) {
-                        args.add(line);
+                        // A test setting replaces a default with the same name
+                        // (a repeated option stops the game's argument parser).
+                        final String opt = line;
+                        final int eq = opt.indexOf('=');
+                        final String key = eq > 0 ? opt.substring(0, eq + 1) : opt;
+                        args.removeIf(a -> a.equals(opt) || a.startsWith(key));
+                        args.add(opt);
                     }
                 }
             } catch (Exception e) {

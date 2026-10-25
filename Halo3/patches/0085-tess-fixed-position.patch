@@ -1,0 +1,60 @@
+From e0456a632495741b05b03731d1201d0ccd209f23 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 23 Oct 2026 22:48:15 -0400
+Subject: [PATCH] gpu_debug_tess_fixed_position: place tessellated vertices at
+ a fixed screen spot (diagnostic)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01JJM25S15YdvewrFFwP8g6Z
+---
+ .../pipeline/shader/spirv_translator.cpp      | 27 +++++++++++++++++++
+ 1 file changed, 27 insertions(+)
+
+diff --git a/src/graphics/pipeline/shader/spirv_translator.cpp b/src/graphics/pipeline/shader/spirv_translator.cpp
+index 8ce66c2..567c641 100644
+--- a/src/graphics/pipeline/shader/spirv_translator.cpp
++++ b/src/graphics/pipeline/shader/spirv_translator.cpp
+@@ -54,6 +54,12 @@ REXCVAR_DEFINE_INT32(gpu_shader_spirv_optimize, 0, "GPU/Shader",
+ REXCVAR_DEFINE_INT32(vulkan_spirv_max_version, 0, "GPU/Vulkan",
+                      "Highest SPIR-V version to emit, as 10/13/14/15 (0 = highest supported)");
+ 
++REXCVAR_DEFINE_BOOL(gpu_debug_tess_fixed_position, false, "GPU",
++                    "Diagnostic only (breaks visuals): tessellated vertices are placed in the "
++                    "middle of the screen by their domain location");
++REXCVAR_DEFINE_DOUBLE(gpu_debug_tess_fixed_position_z, 0.5, "GPU",
++                      "Depth for gpu_debug_tess_fixed_position");
++
+ namespace rex::graphics {
+ 
+ SpirvShaderTranslator::Features::Features(bool all)
+@@ -3238,6 +3244,27 @@ void SpirvShaderTranslator::CompleteVertexOrTessEvalShaderInMain() {
+     }
+     builder_->createStore(position, position_ptr);
+   }
++  if (IsSpirvTessEvalShader() && REXCVAR_GET(gpu_debug_tess_fixed_position)) {
++    // Diagnostic: put every tessellated vertex at a fixed screen spot by its
++    // domain location, ignoring the guest position.
++    spv::Id tess_coord = builder_->createLoad(input_tess_coord_, spv::NoPrecision);
++    spv::Id scale = builder_->makeFloatConstant(0.8f);
++    spv::Id bias = builder_->makeFloatConstant(-0.4f);
++    id_vector_temp_.clear();
++    for (unsigned int i = 0; i < 2; ++i) {
++      id_vector_temp_.push_back(builder_->createBinOp(
++          spv::OpFAdd, type_float_,
++          builder_->createBinOp(spv::OpFMul, type_float_,
++                                builder_->createCompositeExtract(tess_coord, type_float_, i),
++                                scale),
++          bias));
++    }
++    id_vector_temp_.push_back(
++        builder_->makeFloatConstant(float(REXCVAR_GET(gpu_debug_tess_fixed_position_z))));
++    id_vector_temp_.push_back(builder_->makeFloatConstant(1.0f));
++    builder_->createStore(builder_->createCompositeConstruct(type_float4_, id_vector_temp_),
++                          position_ptr);
++  }
+ }
+ 
+ void SpirvShaderTranslator::StartFragmentShaderBeforeMain() {
+-- 
+2.43.0
+

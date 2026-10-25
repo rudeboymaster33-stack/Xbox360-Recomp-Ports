@@ -1,0 +1,167 @@
+From 2100681c01a2dab03924d17b0a91ef7c316c95b8 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 24 Oct 2026 20:14:44 -0400
+Subject: [PATCH] VdSwap pacing: optionally hold the guest after a swap until N
+ vblanks passed (vdswap_min_vblanks), [swap-pace] stats
+
+The guest render thread's swaps alternated ~26/40 ms while the display shows
+an even 33 ms cadence, so time-based camera motion judders against
+tick-based objects (vehicle jerking when turning).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01JJM25S15YdvewrFFwP8g6Z
+---
+ include/rex/graphics/graphics_system.h   | 12 ++++++
+ include/rex/system/interfaces/graphics.h |  4 ++
+ src/graphics/graphics_system.cpp         | 51 ++++++++++++++++++++++++
+ src/kernel/xboxkrnl/xboxkrnl_video.cpp   |  4 ++
+ 4 files changed, 71 insertions(+)
+
+diff --git a/include/rex/graphics/graphics_system.h b/include/rex/graphics/graphics_system.h
+index ac6b056..3cf3bdb 100644
+--- a/include/rex/graphics/graphics_system.h
++++ b/include/rex/graphics/graphics_system.h
+@@ -14,6 +14,7 @@
+ #include "rex/system/function_dispatcher.h"
+ 
+ #include <atomic>
++#include <condition_variable>
+ #include <cstdint>
+ #include <functional>
+ #include <memory>
+@@ -75,6 +76,7 @@ class GraphicsSystem : public system::IGraphicsSystem {
+   void EnableReadPointerWriteBack(uint32_t ptr, uint32_t block_size_log2) override;
+ 
+   void SetInterruptCallback(uint32_t callback, uint32_t user_data) override;
++  void PaceGuestSwap() override;
+   void DispatchInterruptCallback(uint32_t source, uint32_t cpu);
+ 
+   virtual void ClearCaches();
+@@ -127,6 +129,16 @@ class GraphicsSystem : public system::IGraphicsSystem {
+   bool paused_ = false;
+ 
+  private:
++  // Guest swap pacing (vdswap_min_vblanks).
++  std::mutex vblank_pace_mutex_;
++  std::condition_variable vblank_pace_cv_;
++  uint64_t vblank_pace_count_ = 0;
++  uint64_t vblank_pace_last_swap_ = 0;
++  uint64_t vblank_pace_last_ns_ = 0;
++  uint32_t vblank_pace_hist_[6] = {};
++  uint32_t vblank_pace_frames_ = 0;
++  double vblank_pace_wait_ms_ = 0.0;
++
+   std::unique_ptr<::rex::ui::Presenter> presenter_;
+ 
+   std::atomic_flag host_gpu_loss_reported_;
+diff --git a/include/rex/system/interfaces/graphics.h b/include/rex/system/interfaces/graphics.h
+index d54df86..515ae39 100644
+--- a/include/rex/system/interfaces/graphics.h
++++ b/include/rex/system/interfaces/graphics.h
+@@ -58,6 +58,10 @@ class IGraphicsSystem {
+   virtual ui::Presenter* presenter() const { return nullptr; }
+ 
+   // Guest GPU services reached from the xboxkrnl Vd* exports.
++  // Called by VdSwap after the swap is queued: may block the guest render
++  // thread so its frames start on an even vblank grid (as on the console).
++  virtual void PaceGuestSwap() {}
++
+   virtual void SetInterruptCallback(uint32_t callback, uint32_t user_data) {
+     (void)callback;
+     (void)user_data;
+diff --git a/src/graphics/graphics_system.cpp b/src/graphics/graphics_system.cpp
+index 743bc5f..2b4dc08 100644
+--- a/src/graphics/graphics_system.cpp
++++ b/src/graphics/graphics_system.cpp
+@@ -13,6 +13,8 @@
+ #include <rex/graphics/graphics_system.h>
+ 
+ #include <algorithm>
++#include <chrono>
++#include <iterator>
+ #if !defined(_WIN32)
+ #include <cerrno>
+ #include <ctime>
+@@ -39,6 +41,10 @@
+ #include <rex/ui/window.h>
+ #include <rex/ui/windowed_app_context.h>
+ 
++REXCVAR_DEFINE_INT32(vdswap_min_vblanks, 0, "GPU",
++                     "Hold the guest after VdSwap until this many vblanks have passed since its "
++                     "previous swap, so its frames start on an even vblank grid like on the "
++                     "console (2 = 30 fps games). 0 = off");
+ REXCVAR_DEFINE_BOOL(gpu_pause_in_background, true, "GPU",
+                     "Android: stop the guest vblank while the app is in the background, which "
+                     "pauses the game (it waits for vblank) and saves battery");
+@@ -395,8 +401,53 @@ void GraphicsSystem::DispatchInterruptCallback(uint32_t source, uint32_t cpu) {
+                                          rex::countof(args));
+ }
+ 
++void GraphicsSystem::PaceGuestSwap() {
++  const int32_t min_vblanks = REXCVAR_GET(vdswap_min_vblanks);
++  if (min_vblanks <= 0) {
++    return;
++  }
++  ScopedTraceMarker marker("swap_pace");
++  const auto start = std::chrono::steady_clock::now();
++  std::unique_lock<std::mutex> lock(vblank_pace_mutex_);
++  const uint64_t target = vblank_pace_last_swap_ + uint64_t(min_vblanks);
++  if (vblank_pace_count_ < target) {
++    // Bounded, so a paused vblank (background) or shutdown never hangs the
++    // guest forever.
++    vblank_pace_cv_.wait_for(lock, std::chrono::milliseconds(100),
++                             [&] { return vblank_pace_count_ >= target; });
++  }
++  vblank_pace_last_swap_ = vblank_pace_count_;
++  const auto end = std::chrono::steady_clock::now();
++  const uint64_t now_ns =
++      uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(end.time_since_epoch()).count());
++  vblank_pace_wait_ms_ += std::chrono::duration<double, std::milli>(end - start).count();
++  if (vblank_pace_last_ns_) {
++    const double interval_ms = double(now_ns - vblank_pace_last_ns_) / 1e6;
++    // Buckets: <20, 20-30, 30-37, 37-45, 45-60, >60 ms.
++    const int b = interval_ms < 20 ? 0 : interval_ms < 30 ? 1 : interval_ms < 37 ? 2
++                : interval_ms < 45 ? 3 : interval_ms < 60 ? 4 : 5;
++    ++vblank_pace_hist_[b];
++  }
++  vblank_pace_last_ns_ = now_ns;
++  if (++vblank_pace_frames_ >= 300) {
++    REXGPU_INFO("[swap-pace] last 300 guest swaps, interval ms <20:{} 20-30:{} 30-37:{} 37-45:{} "
++                "45-60:{} >60:{} | held {:.1f} ms per swap",
++                vblank_pace_hist_[0], vblank_pace_hist_[1], vblank_pace_hist_[2],
++                vblank_pace_hist_[3], vblank_pace_hist_[4], vblank_pace_hist_[5],
++                vblank_pace_wait_ms_ / 300.0);
++    std::fill(std::begin(vblank_pace_hist_), std::end(vblank_pace_hist_), 0u);
++    vblank_pace_frames_ = 0;
++    vblank_pace_wait_ms_ = 0.0;
++  }
++}
++
+ void GraphicsSystem::MarkVblank() {
+   TraceInstant("vblank");
++  {
++    std::lock_guard<std::mutex> lock(vblank_pace_mutex_);
++    ++vblank_pace_count_;
++  }
++  vblank_pace_cv_.notify_all();
+   // TODO: Enable profiling once ported
+   // SCOPE_profile_cpu_f("gpu");
+ 
+diff --git a/src/kernel/xboxkrnl/xboxkrnl_video.cpp b/src/kernel/xboxkrnl/xboxkrnl_video.cpp
+index d2bc484..6d9fdb5 100644
+--- a/src/kernel/xboxkrnl/xboxkrnl_video.cpp
++++ b/src/kernel/xboxkrnl/xboxkrnl_video.cpp
+@@ -520,6 +520,10 @@ void VdSwap_entry(mapped_void buffer_ptr,      // ptr into primary ringbuffer
+   for (uint32_t i = offset; i < 64; i++) {
+     dwords[i] = xenos::MakePacketType2();
+   }
++
++  if (auto* graphics_system = REX_KERNEL_STATE()->emulator()->graphics_system()) {
++    graphics_system->PaceGuestSwap();
++  }
+ }
+ 
+ void RegisterVideoExports(rex::runtime::ExportResolver* export_resolver,
+-- 
+2.43.0
+

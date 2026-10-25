@@ -1,0 +1,68 @@
+From 90c53ccc5a6abcecb811d54347f5c269ecee8fc3 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 24 Oct 2026 14:56:58 -0400
+Subject: [PATCH] Paced presentation: beat from guest frame rate (publish
+ count), not paint rate - breaks the lock at a 66.7 ms beat; log guest frames
+ replaced before shown
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01JJM25S15YdvewrFFwP8g6Z
+---
+ include/rex/ui/vulkan/presenter.h  |  1 +
+ src/ui/vulkan/vulkan_presenter.cpp | 21 +++++++++++++++++++++
+ 2 files changed, 22 insertions(+)
+
+diff --git a/include/rex/ui/vulkan/presenter.h b/include/rex/ui/vulkan/presenter.h
+index c6c656c..676b33a 100644
+--- a/include/rex/ui/vulkan/presenter.h
++++ b/include/rex/ui/vulkan/presenter.h
+@@ -427,6 +427,7 @@ class VulkanPresenter final : public Presenter {
+     double timing_intervals_ns[15] = {};
+     uint32_t timing_interval_count = 0;
+     uint32_t timing_interval_next = 0;
++    uint64_t timing_publish_count_at_last_call = 0;
+     uint32_t timing_present_id = 0;
+     std::vector<VkImage> swapchain_images;
+     std::vector<SwapchainFramebuffer> swapchain_framebuffers;
+diff --git a/src/ui/vulkan/vulkan_presenter.cpp b/src/ui/vulkan/vulkan_presenter.cpp
+index 2677cd6..61503fd 100644
+--- a/src/ui/vulkan/vulkan_presenter.cpp
++++ b/src/ui/vulkan/vulkan_presenter.cpp
+@@ -2295,6 +2295,26 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
+       uint64_t now = uint64_t(ts.tv_sec) * 1000000000ull + uint64_t(ts.tv_nsec);
+       if (paint_context_.timing_last_call_ns) {
+         double interval = double(now - paint_context_.timing_last_call_ns);
++        // The beat must follow the rate of guest frames, not of paints: when a
++        // paint is late, newer guest frames replace the waiting one, and
++        // counting the paint interval would lock the beat at a lower rate
++        // (e.g. 15 fps from 30 fps guest frames).
++        uint64_t publish_delta =
++            guest_output_publish_count - paint_context_.timing_publish_count_at_last_call;
++        static uint32_t guest_frames_not_shown = 0;
++        if (publish_delta > 1) {
++          guest_frames_not_shown += uint32_t(publish_delta - 1);
++        }
++        static uint32_t guest_frames_paints = 0;
++        if (++guest_frames_paints >= 300) {
++          REXLOG_INFO("[present-pacing] last 300 paints: {} guest frames replaced before shown",
++                      guest_frames_not_shown);
++          guest_frames_paints = 0;
++          guest_frames_not_shown = 0;
++        }
++        if (REXCVAR_GET(vulkan_present_pacing_median) && publish_delta > 1) {
++          interval /= double(publish_delta);
++        }
+         interval = std::clamp(interval, 1e6, 100e6);
+         paint_context_.timing_interval_ema_ns =
+             paint_context_.timing_interval_ema_ns * 0.9 + interval * 0.1;
+@@ -2306,6 +2326,7 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
+             std::min(paint_context_.timing_interval_count + 1, kIntervalHistory);
+       }
+       paint_context_.timing_last_call_ns = now;
++      paint_context_.timing_publish_count_at_last_call = guest_output_publish_count;
+       double beat_interval_ns = paint_context_.timing_interval_ema_ns;
+       if (REXCVAR_GET(vulkan_present_pacing_median) && paint_context_.timing_interval_count) {
+         double sorted_intervals[15];
+-- 
+2.43.0
+

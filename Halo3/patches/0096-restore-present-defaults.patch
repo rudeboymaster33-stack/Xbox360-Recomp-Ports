@@ -1,0 +1,51 @@
+From b49713dcdfb7ab49b1b435a304e71f967ea02fa7 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 24 Oct 2026 10:29:53 -0400
+Subject: [PATCH] Restore the earlier presentation and thread defaults:
+ skipping repeated presents made the UI thread spin (audio stutter); pacing
+ latency 25 ms; fast-cores pinning off
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01JJM25S15YdvewrFFwP8g6Z
+---
+ src/core/threading_posix.cpp       | 2 +-
+ src/ui/vulkan/vulkan_presenter.cpp | 6 +++---
+ 2 files changed, 4 insertions(+), 4 deletions(-)
+
+diff --git a/src/core/threading_posix.cpp b/src/core/threading_posix.cpp
+index e4bbdc9..2ca09fe 100644
+--- a/src/core/threading_posix.cpp
++++ b/src/core/threading_posix.cpp
+@@ -63,7 +63,7 @@ static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only")
+ #define REX_HAS_SIGEV_THREAD_ID 0
+ #endif
+ 
+-REXCVAR_DEFINE_BOOL(android_fast_cores_only, true, "Kernel",
++REXCVAR_DEFINE_BOOL(android_fast_cores_only, false, "Kernel",
+                     "Android: run emulator and game threads only on the fast (big/prime) "
+                     "CPU cores");
+ 
+diff --git a/src/ui/vulkan/vulkan_presenter.cpp b/src/ui/vulkan/vulkan_presenter.cpp
+index 45be603..40a06d0 100644
+--- a/src/ui/vulkan/vulkan_presenter.cpp
++++ b/src/ui/vulkan/vulkan_presenter.cpp
+@@ -53,13 +53,13 @@ REXCVAR_DEFINE_BOOL(present_render_pass_clear, true, "UI/Presenter",
+ REXCVAR_DEFINE_BOOL(vulkan_present_display_timing, true, "UI/Vulkan",
+                     "Schedule each presented frame on an even beat of display refreshes using "
+                     "VK_GOOGLE_display_timing when available (smooth frame pacing on Android)");
+-REXCVAR_DEFINE_INT32(vulkan_present_pacing_latency_ms, 50, "UI/Vulkan",
++REXCVAR_DEFINE_INT32(vulkan_present_pacing_latency_ms, 25, "UI/Vulkan",
+                      "Paced presentation: how far ahead (ms) a frame is scheduled when the even "
+                      "cadence (re)starts - headroom that absorbs frames arriving a little late");
+-REXCVAR_DEFINE_INT32(vulkan_present_pacing_min_lead_ms, 9, "UI/Vulkan",
++REXCVAR_DEFINE_INT32(vulkan_present_pacing_min_lead_ms, 25, "UI/Vulkan",
+                      "Paced presentation: a frame keeps its place in the cadence as long as it "
+                      "arrives at least this many ms before its scheduled time");
+-REXCVAR_DEFINE_BOOL(vulkan_present_skip_repeated_frames, true, "UI/Vulkan",
++REXCVAR_DEFINE_BOOL(vulkan_present_skip_repeated_frames, false, "UI/Vulkan",
+                     "Paced presentation: don't present the same guest frame twice");
+ REXCVAR_DEFINE_INT32(vulkan_present_pacing_image_count, 4, "UI/Vulkan",
+                      "Paced presentation: swapchain images, so frames scheduled ahead don't "
+-- 
+2.43.0
+

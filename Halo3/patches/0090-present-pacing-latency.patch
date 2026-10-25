@@ -1,0 +1,78 @@
+From a80d48361409a732897cc97a8b23c6e54399f70a Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 24 Oct 2026 09:50:58 -0400
+Subject: [PATCH] Paced presentation: keep late frames on the beat
+ (vulkan_present_pacing_latency_ms / _min_lead_ms), log cadence restarts
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01JJM25S15YdvewrFFwP8g6Z
+---
+ src/ui/vulkan/vulkan_presenter.cpp | 44 ++++++++++++++++++++++++++----
+ 1 file changed, 39 insertions(+), 5 deletions(-)
+
+diff --git a/src/ui/vulkan/vulkan_presenter.cpp b/src/ui/vulkan/vulkan_presenter.cpp
+index f178408..d4d74bd 100644
+--- a/src/ui/vulkan/vulkan_presenter.cpp
++++ b/src/ui/vulkan/vulkan_presenter.cpp
+@@ -53,6 +53,12 @@ REXCVAR_DEFINE_BOOL(present_render_pass_clear, true, "UI/Presenter",
+ REXCVAR_DEFINE_BOOL(vulkan_present_display_timing, true, "UI/Vulkan",
+                     "Schedule each presented frame on an even beat of display refreshes using "
+                     "VK_GOOGLE_display_timing when available (smooth frame pacing on Android)");
++REXCVAR_DEFINE_INT32(vulkan_present_pacing_latency_ms, 50, "UI/Vulkan",
++                     "Paced presentation: how far ahead (ms) a frame is scheduled when the even "
++                     "cadence (re)starts - headroom that absorbs frames arriving a little late");
++REXCVAR_DEFINE_INT32(vulkan_present_pacing_min_lead_ms, 9, "UI/Vulkan",
++                     "Paced presentation: a frame keeps its place in the cadence as long as it "
++                     "arrives at least this many ms before its scheduled time");
+ REXCVAR_DEFINE_BOOL(vulkan_allow_present_mode_immediate, true, "UI/Vulkan",
+                     "Allow immediate present mode (no vsync)");
+ 
+@@ -2271,12 +2277,40 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
+       uint64_t cycles = std::max<uint64_t>(
+           1, uint64_t(std::llround(paint_context_.timing_interval_ema_ns / double(refresh))));
+       uint64_t step = cycles * refresh;
+-      // Leave room for the GPU to finish the frame before it is due.
+-      uint64_t earliest = now + std::max<uint64_t>(2 * refresh, 25000000ull);
++      // Keep every frame on an even beat. A frame that arrives a bit late
++      // (the game sometimes delivers frames 50 ms + 17 ms apart instead of
++      // 33 + 33) still keeps its beat as long as it arrives min_lead before
++      // it is due; the cadence (re)starts with enough latency to absorb that.
++      uint64_t min_lead =
++          std::max<uint64_t>(uint64_t(std::max(REXCVAR_GET(vulkan_present_pacing_min_lead_ms), 1)) *
++                                 1000000ull,
++                             refresh);
++      uint64_t restart_lead = std::max<uint64_t>(
++          uint64_t(std::max(REXCVAR_GET(vulkan_present_pacing_latency_ms), 1)) * 1000000ull,
++          min_lead + refresh);
+       uint64_t desired = paint_context_.timing_last_desired_ns + step;
+-      if (!paint_context_.timing_last_desired_ns || desired < earliest ||
+-          desired > now + 4 * step + 25000000ull) {
+-        desired = earliest;  // (Re)start the cadence.
++      bool restart = !paint_context_.timing_last_desired_ns || desired < now + min_lead ||
++                     desired > now + restart_lead + 2 * step;
++      if (restart) {
++        desired = now + restart_lead;  // (Re)start the cadence.
++      }
++      {
++        static uint32_t pacing_presents = 0, pacing_restarts = 0;
++        static double pacing_lead_sum_ms = 0.0, pacing_lead_min_ms = 1e9;
++        double lead_ms = double(desired - now) * 1e-6;
++        ++pacing_presents;
++        pacing_restarts += restart;
++        pacing_lead_sum_ms += lead_ms;
++        pacing_lead_min_ms = std::min(pacing_lead_min_ms, lead_ms);
++        if (pacing_presents >= 300) {
++          REXLOG_INFO("[present-pacing] 300 frames: {} beats every {:.1f} ms, cadence restarts={} "
++                      "lead avg={:.1f} ms min={:.1f} ms",
++                      cycles, double(step) * 1e-6, pacing_restarts,
++                      pacing_lead_sum_ms / pacing_presents, pacing_lead_min_ms);
++          pacing_presents = pacing_restarts = 0;
++          pacing_lead_sum_ms = 0.0;
++          pacing_lead_min_ms = 1e9;
++        }
+       }
+       paint_context_.timing_last_desired_ns = desired;
+       present_time.presentID = ++paint_context_.timing_present_id;
+-- 
+2.43.0
+

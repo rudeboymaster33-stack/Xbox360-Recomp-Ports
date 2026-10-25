@@ -1,0 +1,114 @@
+From 6e29af4460e8b9f7335e7e43f09bc1a4b4e907ce Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 24 Oct 2026 16:19:10 -0400
+Subject: [PATCH] More presentation trace instants
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01JJM25S15YdvewrFFwP8g6Z
+---
+ src/ui/vulkan/vulkan_presenter.cpp | 12 ++++++++++++
+ 1 file changed, 12 insertions(+)
+
+diff --git a/src/ui/vulkan/vulkan_presenter.cpp b/src/ui/vulkan/vulkan_presenter.cpp
+index 78a811a..85c9cef 100644
+--- a/src/ui/vulkan/vulkan_presenter.cpp
++++ b/src/ui/vulkan/vulkan_presenter.cpp
+@@ -1584,6 +1584,7 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
+   const VkDevice device = vulkan_device_->device();
+ 
+   VkCommandPool draw_command_pool = paint_submission.draw_command_pool();
++  TraceInstant("p1_reset_pool");
+   if (dfn.vkResetCommandPool(device, draw_command_pool, 0) != VK_SUCCESS) {
+     REXLOG_ERROR(
+         "VulkanPresenter: Failed to reset a command buffer for drawing to the "
+@@ -1591,6 +1592,7 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
+     return PaintResult::kNotPresented;
+   }
+ 
++  TraceInstant("p2_begin_cb");
+   VkCommandBuffer draw_command_buffer = paint_submission.draw_command_buffer();
+   VkCommandBufferBeginInfo command_buffer_begin_info;
+   command_buffer_begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+@@ -1606,6 +1608,7 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
+   // vkResetCommandPool resets from both initial and recording states, still
+   // safe to return early from this function in case of an error.
+ 
++  TraceInstant("p3_acquire_next");
+   VkSemaphore acquire_semaphore = paint_submission.acquire_semaphore();
+   uint32_t swapchain_image_index;
+   VkResult acquire_result;
+@@ -1689,6 +1692,7 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
+     // multiple threads can't paint the main target at the same time).
+   }
+ 
++  TraceInstant("p4_guest_output");
+   if (guest_output_image) {
+     VkExtent2D max_framebuffer_extent =
+         util::GetMax2DFramebufferExtent(vulkan_device_->properties());
+@@ -1716,6 +1720,7 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
+           guest_output_image_paint_ref_new_index = i;
+         }
+       }
++      TraceInstant("p4a_refs");
+       if (guest_output_image_paint_ref_index == SIZE_MAX) {
+         // New image - store the reference and create the descriptors.
+         if (guest_output_image_paint_ref_new_index == SIZE_MAX) {
+@@ -1765,6 +1770,7 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
+ 
+       // Make sure intermediate textures of the needed size are available, and
+       // unneeded intermediate textures are destroyed.
++      TraceInstant("p4b_intermediates");
+       for (size_t i = 0; i < kMaxGuestOutputPaintEffects - 1; ++i) {
+         std::pair<uint32_t, uint32_t> intermediate_needed_size(0, 0);
+         if (i + 1 < guest_output_flow.effect_count) {
+@@ -1853,6 +1859,7 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
+         }
+       }
+ 
++      TraceInstant("p4c_pipelines");
+       if (guest_output_flow.effect_count) {
+         // Check if all the intermediate effects are supported by the
+         // implementation.
+@@ -1890,6 +1897,7 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
+         }
+       }
+ 
++      TraceInstant("p4d_effects");
+       if (guest_output_flow.effect_count) {
+         // Actually draw the guest output.
+         paint_context_.guest_output_image_paint_refs[guest_output_image_paint_ref_index].first =
+@@ -2155,6 +2163,7 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
+   // anymore (this is done after various potential guest-output-related main
+   // target submission tracker waits so the completed submission value is the
+   // most actual).
++  TraceInstant("p5_after_guest_output");
+   uint64_t completed_paint_submission =
+       paint_context_.submission_tracker.UpdateAndGetCompletedSubmission();
+   for (std::pair<uint64_t, std::shared_ptr<GuestOutputImage>>& guest_output_image_paint_ref :
+@@ -2186,6 +2195,7 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
+     swapchain_image_clear_needed = false;
+   }
+ 
++  TraceInstant("p6_ui_drawers");
+   if (execute_ui_drawers) {
+     // Draw the UI.
+     VulkanUIDrawContext ui_draw_context(
+@@ -2196,6 +2206,7 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
+     ExecuteUIDrawersFromUIThread(ui_draw_context);
+   }
+ 
++  TraceInstant("p7_end_cb");
+   dfn.vkCmdEndRenderPass(draw_command_buffer);
+ 
+   dfn.vkEndCommandBuffer(draw_command_buffer);
+@@ -2273,6 +2284,7 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
+     }
+   }
+ 
++  TraceInstant("p8_present_setup");
+   VkPresentInfoKHR present_info;
+   present_info.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
+   present_info.pNext = nullptr;
+-- 
+2.43.0
+

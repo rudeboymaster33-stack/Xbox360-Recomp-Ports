@@ -1,0 +1,115 @@
+From 2b6c3bdfa2e0f888cfa5ab059c50a49ce709caaf Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 24 Oct 2026 10:00:28 -0400
+Subject: [PATCH] Paced presentation: present each guest frame once (skip
+ repaints of the same frame), 4 swapchain images
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01JJM25S15YdvewrFFwP8g6Z
+---
+ include/rex/ui/presenter.h         |  8 ++++++++
+ include/rex/ui/vulkan/presenter.h  |  1 +
+ src/ui/presenter.cpp               |  1 +
+ src/ui/vulkan/vulkan_presenter.cpp | 22 ++++++++++++++++++++++
+ 4 files changed, 32 insertions(+)
+
+diff --git a/include/rex/ui/presenter.h b/include/rex/ui/presenter.h
+index f1904e0..eaed79a 100644
+--- a/include/rex/ui/presenter.h
++++ b/include/rex/ui/presenter.h
+@@ -383,6 +383,13 @@ class Presenter {
+   void RequestUIPaintFromUIThread();
+ 
+  protected:
++  // Counts guest output frames handed to the presentation (for telling a new
++  // frame from a repaint of the same one).
++  uint64_t GetGuestOutputPublishCount() const {
++    return guest_output_publish_count_.load(std::memory_order_acquire);
++  }
++  bool HasUIDrawers() const { return !ui_drawers_.empty(); }
++
+   enum class PaintResult {
+     kPresented,
+     kPresentedSuboptimal,
+@@ -959,6 +966,7 @@ class Presenter {
+   // These two images can be accessed by painting in parallel, in an unordered
+   // way, with guest output refreshing.
+   std::atomic<uint32_t> guest_output_mailbox_acquired_and_ready_{0};
++  std::atomic<uint64_t> guest_output_publish_count_{0};
+   // The "writable" image is different than both "acquired" and "ready" and is
+   // accessible only by the guest output refreshing - it's the image that the
+   // refresher may write to.
+diff --git a/include/rex/ui/vulkan/presenter.h b/include/rex/ui/vulkan/presenter.h
+index bc60610..571ee26 100644
+--- a/include/rex/ui/vulkan/presenter.h
++++ b/include/rex/ui/vulkan/presenter.h
+@@ -418,6 +418,7 @@ class VulkanPresenter final : public Presenter {
+     VkSwapchainKHR timing_swapchain = VK_NULL_HANDLE;
+     uint64_t timing_refresh_ns = 0;
+     uint64_t timing_last_desired_ns = 0;
++    uint64_t timing_last_publish_count = 0;
+     uint64_t timing_last_call_ns = 0;
+     double timing_interval_ema_ns = 33333333.0;
+     uint32_t timing_present_id = 0;
+diff --git a/src/ui/presenter.cpp b/src/ui/presenter.cpp
+index 7360ed9..7559259 100644
+--- a/src/ui/presenter.cpp
++++ b/src/ui/presenter.cpp
+@@ -592,6 +592,7 @@ bool Presenter::RefreshGuestOutput(
+       last_acquired_and_ready,
+       (last_acquired_and_ready & 3) | (guest_output_mailbox_writable_ << 2),
+       std::memory_order_acq_rel, std::memory_order_relaxed)) {}
++  guest_output_publish_count_.fetch_add(1, std::memory_order_acq_rel);
+   // Now, it's known that `ready == writable` on the host presentation side.
+   // Take the next `writable` with this assumption about its current value in
+   // mind.
+diff --git a/src/ui/vulkan/vulkan_presenter.cpp b/src/ui/vulkan/vulkan_presenter.cpp
+index d4d74bd..45be603 100644
+--- a/src/ui/vulkan/vulkan_presenter.cpp
++++ b/src/ui/vulkan/vulkan_presenter.cpp
+@@ -59,6 +59,11 @@ REXCVAR_DEFINE_INT32(vulkan_present_pacing_latency_ms, 50, "UI/Vulkan",
+ REXCVAR_DEFINE_INT32(vulkan_present_pacing_min_lead_ms, 9, "UI/Vulkan",
+                      "Paced presentation: a frame keeps its place in the cadence as long as it "
+                      "arrives at least this many ms before its scheduled time");
++REXCVAR_DEFINE_BOOL(vulkan_present_skip_repeated_frames, true, "UI/Vulkan",
++                    "Paced presentation: don't present the same guest frame twice");
++REXCVAR_DEFINE_INT32(vulkan_present_pacing_image_count, 4, "UI/Vulkan",
++                     "Paced presentation: swapchain images, so frames scheduled ahead don't "
++                     "block painting the next one");
+ REXCVAR_DEFINE_BOOL(vulkan_allow_present_mode_immediate, true, "UI/Vulkan",
+                     "Allow immediate present mode (no vsync)");
+ 
+@@ -1334,6 +1339,12 @@ VkSwapchainKHR VulkanPresenter::PaintContext::CreateSwapchainForVulkanSurface(
+   swapchain_create_info.surface = surface;
+   swapchain_create_info.minImageCount =
+       std::max(kSubmissionCount, surface_capabilities.minImageCount);
++  if (REXCVAR_GET(vulkan_present_display_timing) &&
++      vulkan_device->extensions().ext_GOOGLE_display_timing) {
++    swapchain_create_info.minImageCount =
++        std::max(swapchain_create_info.minImageCount,
++                 uint32_t(std::max(REXCVAR_GET(vulkan_present_pacing_image_count), 1)));
++  }
+   if (surface_capabilities.maxImageCount) {
+     swapchain_create_info.minImageCount =
+         std::min(swapchain_create_info.minImageCount, surface_capabilities.maxImageCount);
+@@ -1539,6 +1550,17 @@ bool VulkanPresenter::GuestOutputImage::Initialize() {
+ }
+ 
+ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_drawers) {
++  // With paced presentation, every guest frame must take exactly one beat:
++  // repainting a frame that has already been presented would take a beat of
++  // its own and push all the following frames later.
++  uint64_t guest_output_publish_count = GetGuestOutputPublishCount();
++  if (REXCVAR_GET(vulkan_present_skip_repeated_frames) &&
++      REXCVAR_GET(vulkan_present_display_timing) && paint_context_.timing_refresh_ns &&
++      !HasUIDrawers() && guest_output_publish_count &&
++      guest_output_publish_count == paint_context_.timing_last_publish_count) {
++    return PaintResult::kPresented;
++  }
++  paint_context_.timing_last_publish_count = guest_output_publish_count;
+   // Begin the submission in place of the one not currently potentially used on
+   // the GPU.
+   uint64_t current_paint_submission_index =
+-- 
+2.43.0
+

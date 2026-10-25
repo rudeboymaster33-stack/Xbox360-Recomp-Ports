@@ -1,0 +1,36 @@
+From 421d9309394591bc4a6424f30728728c6ff4c901 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 24 Oct 2026 11:25:10 -0400
+Subject: [PATCH] gpu_stats_frames: configurable stats/GPU time log window
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01JJM25S15YdvewrFFwP8g6Z
+---
+ src/graphics/vulkan/command_processor.cpp | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
+index 52f4265..0ab9acf 100644
+--- a/src/graphics/vulkan/command_processor.cpp
++++ b/src/graphics/vulkan/command_processor.cpp
+@@ -127,6 +127,8 @@ REXCVAR_DEFINE_BOOL(gpu_debug_fault_watch, false, "GPU",
+ REXCVAR_DEFINE_BOOL(gpu_frame_trace, true, "GPU",
+                     "With vulkan_gpu_timestamps, also write the detailed [gpu-dt] trace of one "
+                     "frame every 120 frames (very verbose)");
++REXCVAR_DEFINE_INT32(gpu_stats_frames, 120, "GPU",
++                     "Frames per [gpu-fps] / [gpu-stats] / [gpu-time] log window");
+ REXCVAR_DEFINE_BOOL(gpu_gamma_double_multiply_fix, true, "GPU",
+                     "With gamma render targets converted in shaders, convert \"double "
+                     "multiply\" blended colors so 0.5 stays neutral (Halo 3 decal boxes)");
+@@ -2632,7 +2634,7 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
+       }
+       hitch_prev = st;
+     }
+-    if (++st.frames >= 120) {
++    if (++st.frames >= uint64_t(std::max(REXCVAR_GET(gpu_stats_frames), 10))) {
+       double f = double(st.frames);
+       static auto fps_last_time = std::chrono::steady_clock::now();
+       auto fps_now = std::chrono::steady_clock::now();
+-- 
+2.43.0
+

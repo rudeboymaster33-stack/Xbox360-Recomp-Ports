@@ -1,0 +1,48 @@
+From a92e3c7a24a35db098975fb237441ab6eca82689 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 24 Oct 2026 17:48:32 -0400
+Subject: [PATCH] Paced presentation: lead capped at target + 1 refresh,
+ defaults 8 ms (lower latency)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01JJM25S15YdvewrFFwP8g6Z
+---
+ src/ui/vulkan/vulkan_presenter.cpp | 13 +++++++++++--
+ 1 file changed, 11 insertions(+), 2 deletions(-)
+
+diff --git a/src/ui/vulkan/vulkan_presenter.cpp b/src/ui/vulkan/vulkan_presenter.cpp
+index 6480670..76702bd 100644
+--- a/src/ui/vulkan/vulkan_presenter.cpp
++++ b/src/ui/vulkan/vulkan_presenter.cpp
+@@ -54,10 +54,13 @@ REXCVAR_DEFINE_BOOL(present_render_pass_clear, true, "UI/Presenter",
+ REXCVAR_DEFINE_BOOL(vulkan_present_display_timing, true, "UI/Vulkan",
+                     "Schedule each presented frame on an even beat of display refreshes using "
+                     "VK_GOOGLE_display_timing when available (smooth frame pacing on Android)");
+-REXCVAR_DEFINE_INT32(vulkan_present_pacing_latency_ms, 25, "UI/Vulkan",
++REXCVAR_DEFINE_BOOL(vulkan_present_pacing_max_lead, true, "UI/Vulkan",
++                    "Paced presentation: never schedule a frame more than one refresh past "
++                    "the target lead (lower input-to-screen latency)");
++REXCVAR_DEFINE_INT32(vulkan_present_pacing_latency_ms, 8, "UI/Vulkan",
+                      "Paced presentation: how far ahead (ms) a frame is scheduled when the even "
+                      "cadence (re)starts - headroom that absorbs frames arriving a little late");
+-REXCVAR_DEFINE_INT32(vulkan_present_pacing_min_lead_ms, 25, "UI/Vulkan",
++REXCVAR_DEFINE_INT32(vulkan_present_pacing_min_lead_ms, 8, "UI/Vulkan",
+                      "Paced presentation: a frame keeps its place in the cadence as long as it "
+                      "arrives at least this many ms before its scheduled time");
+ REXCVAR_DEFINE_BOOL(vulkan_present_pacing_median, true, "Vulkan",
+@@ -2385,6 +2388,12 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
+                      desired > now + restart_lead + 2 * step;
+       if (restart) {
+         desired = now + restart_lead;  // (Re)start the cadence.
++      } else if (REXCVAR_GET(vulkan_present_pacing_max_lead) &&
++                 desired > now + restart_lead + refresh) {
++        // Frames arriving early let the beat drift ahead of them (up to two
++        // whole frames of extra latency before a restart) - keep it within one
++        // refresh of the target lead instead.
++        desired = now + restart_lead + refresh;
+       }
+       {
+         static uint32_t pacing_presents = 0, pacing_restarts = 0;
+-- 
+2.43.0
+

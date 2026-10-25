@@ -1,0 +1,53 @@
+From 96ef7ab35450670deff554bbf9d498caaf371fae Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 24 Oct 2026 15:31:08 -0400
+Subject: [PATCH] gpu_progressive_read_pointer_writeback: write the ring read
+ pointer back after every primary packet
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01JJM25S15YdvewrFFwP8g6Z
+---
+ src/graphics/command_processor.cpp | 13 +++++++++++++
+ 1 file changed, 13 insertions(+)
+
+diff --git a/src/graphics/command_processor.cpp b/src/graphics/command_processor.cpp
+index 06bdc98..388391f 100644
+--- a/src/graphics/command_processor.cpp
++++ b/src/graphics/command_processor.cpp
+@@ -39,6 +39,11 @@
+ REXCVAR_DEFINE_BOOL(gpu_debug_ignore_bins, false, "GPU",
+                     "Diagnostic: execute predicated packets regardless of the bin select/mask");
+ REXCVAR_DEFINE_BOOL(vsync, true, "GPU", "Enable vertical sync");
++REXCVAR_DEFINE_BOOL(gpu_progressive_read_pointer_writeback, true, "GPU",
++                    "Write the ring buffer read pointer back to guest memory after every "
++                    "primary ring packet instead of only after all pending packets, so the "
++                    "game, which waits for the GPU to pass a point in the ring, continues "
++                    "sooner");
+ REXCVAR_DEFINE_BOOL(gpu_collapse_predicated_tiles, false, "GPU",
+                     "Draw games that use predicated tiling (the screen drawn in strips because "
+                     "of the 10 MB EDRAM) in one pass: the first tile covers the whole screen and "
+@@ -627,6 +632,8 @@ uint32_t CommandProcessor::ExecutePrimaryBuffer(uint32_t read_index, uint32_t wr
+   memory::RingBuffer reader(memory_->TranslatePhysical(primary_buffer_ptr_), primary_buffer_size_);
+   reader.set_read_offset(read_index * sizeof(uint32_t));
+   reader.set_write_offset(write_index * sizeof(uint32_t));
++  const bool progressive_writeback =
++      read_ptr_writeback_ptr_ && REXCVAR_GET(gpu_progressive_read_pointer_writeback);
+   do {
+     if (!ExecutePacket(&reader)) {
+       // This probably should be fatal - but we're going to continue anyways.
+@@ -634,6 +641,12 @@ uint32_t CommandProcessor::ExecutePrimaryBuffer(uint32_t read_index, uint32_t wr
+       assert_always();
+       break;
+     }
++    if (progressive_writeback && reader.read_count()) {
++      // The packet (including any indirect buffer it called) has been fully
++      // consumed - guest data it references has been copied for the host.
++      memory::store_and_swap<uint32_t>(memory_->TranslatePhysical(read_ptr_writeback_ptr_),
++                                       uint32_t(reader.read_offset() / sizeof(uint32_t)));
++    }
+   } while (reader.read_count());
+ 
+   OnPrimaryBufferEnd();
+-- 
+2.43.0
+

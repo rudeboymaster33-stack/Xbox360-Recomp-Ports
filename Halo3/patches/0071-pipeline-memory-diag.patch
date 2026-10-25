@@ -1,0 +1,98 @@
+From 0da36f670bcc949c1b8d8b0e54b545bd447ce81d Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 22 Oct 2026 21:45:58 -0400
+Subject: [PATCH] vulkan: vulkan_debug_pipeline_memory diagnostic (GPU memory
+ taken by each pipeline creation)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01JJM25S15YdvewrFFwP8g6Z
+---
+ src/graphics/vulkan/pipeline_cache.cpp | 56 ++++++++++++++++++++++++++
+ 1 file changed, 56 insertions(+)
+
+diff --git a/src/graphics/vulkan/pipeline_cache.cpp b/src/graphics/vulkan/pipeline_cache.cpp
+index e93c9ea..334308d 100644
+--- a/src/graphics/vulkan/pipeline_cache.cpp
++++ b/src/graphics/vulkan/pipeline_cache.cpp
+@@ -10,6 +10,9 @@
+  */
+ 
+ #include <algorithm>
++#include <cstdio>
++#include <mutex>
++#include <unistd.h>
+ #include <array>
+ #include <atomic>
+ #include <cstdint>
+@@ -62,6 +65,9 @@ REXCVAR_DEFINE_INT32(vulkan_pipeline_live_limit, 0, "GPU/Vulkan",
+ REXCVAR_DEFINE_INT32(vulkan_pipeline_preload_limit, -1, "GPU/Vulkan",
+                      "Create at most this many pipelines from the pipeline storage at startup "
+                      "(the rest are created when first needed). -1 = all");
++REXCVAR_DEFINE_BOOL(vulkan_debug_pipeline_memory, false, "GPU/Vulkan",
++                    "Diagnostic: log how much GPU memory (Adreno kgsl) each pipeline creation "
++                    "takes, with shader details (creations are serialized while enabled)");
+ REXCVAR_DEFINE_BOOL(vulkan_tessellation_wireframe, false, "GPU/Vulkan",
+                     "Render tessellation as wireframe")
+     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+@@ -3558,8 +3564,58 @@ bool VulkanPipelineCache::EnsurePipelineCreated(const PipelineCreationArguments&
+   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+   const VkDevice device = vulkan_device->device();
+   VkPipeline pipeline;
++  bool debug_memory = REXCVAR_GET(vulkan_debug_pipeline_memory);
++  static std::mutex debug_memory_mutex;
++  std::unique_lock<std::mutex> debug_memory_lock(debug_memory_mutex, std::defer_lock);
++  int64_t debug_memory_before = 0;
++  auto read_gpu_memory = []() -> int64_t {
++    char path[96];
++    snprintf(path, sizeof(path), "/sys/class/kgsl/kgsl/proc/%d/gpumem_mapped", int(getpid()));
++    FILE* f = fopen(path, "rb");
++    if (!f) {
++      return -1;
++    }
++    long long value = -1;
++    if (fscanf(f, "%lld", &value) != 1) {
++      value = -1;
++    }
++    fclose(f);
++    return int64_t(value);
++  };
++  if (debug_memory) {
++    debug_memory_lock.lock();
++    debug_memory_before = read_gpu_memory();
++  }
+   VkResult create_result = dfn.vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1,
+                                                          &pipeline_create_info, nullptr, &pipeline);
++  if (debug_memory) {
++    int64_t debug_memory_after = read_gpu_memory();
++    const Shader& vs = creation_arguments.vertex_shader->shader();
++    const Shader* ps =
++        creation_arguments.pixel_shader ? &creation_arguments.pixel_shader->shader() : nullptr;
++    static uint64_t debug_memory_total_kb = 0;
++    int64_t delta_kb = (debug_memory_before >= 0 && debug_memory_after >= 0)
++                           ? (debug_memory_after - debug_memory_before) / 1024
++                           : -1;
++    if (delta_kb > 0) {
++      debug_memory_total_kb += uint64_t(delta_kb);
++    }
++    REXGPU_INFO(
++        "[gpu-pipemem] {:+}KB total={}MB vs={:016X} vs_spirv={} vs_regs={} vs_dyn={} "
++        "ps={:016X} ps_spirv={} ps_regs={} ps_dyn={} placeholder={} topo={} rp={:08X}",
++        delta_kb, debug_memory_total_kb / 1024, vs.ucode_data_hash(),
++        creation_arguments.vertex_shader->translated_binary().size(),
++        vs.register_static_address_bound(), uint32_t(vs.uses_register_dynamic_addressing()),
++        ps ? ps->ucode_data_hash() : 0,
++        creation_arguments.pixel_shader
++            ? creation_arguments.pixel_shader->translated_binary().size()
++            : 0,
++        ps ? ps->register_static_address_bound() : 0,
++        ps ? uint32_t(ps->uses_register_dynamic_addressing()) : 0,
++        uint32_t(fragment_shader_override != VK_NULL_HANDLE),
++        uint32_t(description.primitive_topology), description.render_pass_key.key);
++    debug_memory_lock.unlock();
++  }
+   if (create_result != VK_SUCCESS) {
+     uint64_t ps_hash = creation_arguments.pixel_shader
+                            ? creation_arguments.pixel_shader->shader().ucode_data_hash()
+-- 
+2.43.0
+

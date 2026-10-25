@@ -8,7 +8,7 @@ echo   from: %GAME_ISO%
 echo   to:   %GAME%
 echo.
 "%PY%" "%ROOT%scripts\unpack_disc.py" "%GAME_ISO%" "%GAME%"
-if errorlevel 1 (echo UNPACK FAILED - tell Claude. & pause & exit /b 1)
+if errorlevel 1 (echo UNPACK FAILED - see the logs folder. & pause & exit /b 1)
 echo.
 echo Game files unpacked.
 pause

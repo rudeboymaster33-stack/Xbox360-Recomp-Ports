@@ -1,0 +1,89 @@
+From 4015538875cce54427c0393cf19aabb619a27b48 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 24 Oct 2026 16:11:27 -0400
+Subject: [PATCH] Trace markers inside presentation (awaits, acquire, consume,
+ submit, present) and CP queue submit
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01JJM25S15YdvewrFFwP8g6Z
+---
+ src/graphics/vulkan/command_processor.cpp |  1 +
+ src/ui/vulkan/vulkan_presenter.cpp        | 15 ++++++++++++---
+ 2 files changed, 13 insertions(+), 3 deletions(-)
+
+diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
+index c61150a..5b1c6e2 100644
+--- a/src/graphics/vulkan/command_processor.cpp
++++ b/src/graphics/vulkan/command_processor.cpp
+@@ -7074,6 +7074,7 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
+     }
+     VkResult submit_result;
+     {
++      ScopedTraceMarker trace_marker_submit("cp_queue_submit");
+       ui::vulkan::VulkanDevice::Queue::Acquisition queue_acquisition =
+           vulkan_device->AcquireQueue(vulkan_device->queue_family_graphics_compute(), 0);
+       submit_result = dfn.vkQueueSubmit(queue_acquisition.queue(), 1, &submit_info, fence);
+diff --git a/src/ui/vulkan/vulkan_presenter.cpp b/src/ui/vulkan/vulkan_presenter.cpp
+index dca61dc..78a811a 100644
+--- a/src/ui/vulkan/vulkan_presenter.cpp
++++ b/src/ui/vulkan/vulkan_presenter.cpp
+@@ -1573,6 +1573,7 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
+       paint_context_.submission_tracker.GetCurrentSubmission();
+   uint64_t paint_submission_count = uint64_t(paint_context_.submissions.size());
+   if (current_paint_submission_index >= paint_submission_count) {
++    ScopedTraceMarker trace_marker_await("p_await_submission");
+     paint_context_.submission_tracker.AwaitSubmissionCompletion(current_paint_submission_index -
+                                                                 paint_submission_count);
+   }
+@@ -1607,9 +1608,13 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
+ 
+   VkSemaphore acquire_semaphore = paint_submission.acquire_semaphore();
+   uint32_t swapchain_image_index;
+-  VkResult acquire_result =
+-      dfn.vkAcquireNextImageKHR(device, paint_context_.swapchain, UINT64_MAX, acquire_semaphore,
+-                                VK_NULL_HANDLE, &swapchain_image_index);
++  VkResult acquire_result;
++  {
++    ScopedTraceMarker trace_marker_acquire("p_acquire");
++    acquire_result =
++        dfn.vkAcquireNextImageKHR(device, paint_context_.swapchain, UINT64_MAX, acquire_semaphore,
++                                  VK_NULL_HANDLE, &swapchain_image_index);
++  }
+   switch (acquire_result) {
+     case VK_SUCCESS:
+     case VK_SUBOPTIMAL_KHR:
+@@ -1671,6 +1676,7 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
+   std::shared_ptr<GuestOutputImage> guest_output_image;
+   {
+     uint32_t guest_output_mailbox_index;
++    ScopedTraceMarker trace_marker_consume("p_consume");
+     std::unique_lock<std::mutex> guest_output_consumer_lock(ConsumeGuestOutput(
+         guest_output_mailbox_index, &guest_output_properties, &guest_output_paint_config));
+     if (guest_output_mailbox_index != UINT32_MAX) {
+@@ -1724,6 +1730,7 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
+           }
+           // Await the completion of the usage of the old guest output image and
+           // its descriptors.
++          ScopedTraceMarker trace_marker_ref("p_await_paint_ref");
+           paint_context_.submission_tracker.AwaitSubmissionCompletion(
+               paint_context_.guest_output_image_paint_refs[guest_output_image_paint_ref_new_index]
+                   .first);
+@@ -2234,6 +2241,7 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
+     }
+     VkResult submit_result;
+     {
++      ScopedTraceMarker trace_marker_qs("p_queue_submit");
+       const VulkanDevice::Queue::Acquisition queue_acquisition =
+           vulkan_device_->AcquireQueue(vulkan_device_->queue_family_graphics_compute(), 0);
+       submit_result =
+@@ -2396,6 +2404,7 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
+   present_info.pResults = nullptr;
+   VkResult present_result;
+   {
++    ScopedTraceMarker trace_marker_qp("p_queue_present");
+     const VulkanDevice::Queue::Acquisition queue_acquisition =
+         vulkan_device_->AcquireQueue(paint_context_.present_queue_family, 0);
+     present_result = dfn.vkQueuePresentKHR(queue_acquisition.queue(), &present_info);
+-- 
+2.43.0
+

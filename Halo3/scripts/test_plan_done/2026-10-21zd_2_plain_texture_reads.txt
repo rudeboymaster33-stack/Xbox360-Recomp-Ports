@@ -1,2 +1,0 @@
-#wait=65
---gpu_debug_tfetch_plain=true

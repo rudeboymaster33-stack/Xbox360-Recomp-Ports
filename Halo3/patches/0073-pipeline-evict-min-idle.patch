@@ -1,0 +1,44 @@
+From f41acaf4a2627eceff1cc48c99f43fb42855eec1 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 23 Oct 2026 19:49:53 -0400
+Subject: [PATCH] vulkan: never evict pipelines used in the last
+ vulkan_pipeline_evict_min_idle submissions (no working-set thrash)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01JJM25S15YdvewrFFwP8g6Z
+---
+ src/graphics/vulkan/pipeline_cache.cpp | 11 +++++++++--
+ 1 file changed, 9 insertions(+), 2 deletions(-)
+
+diff --git a/src/graphics/vulkan/pipeline_cache.cpp b/src/graphics/vulkan/pipeline_cache.cpp
+index f5f145d..e92391e 100644
+--- a/src/graphics/vulkan/pipeline_cache.cpp
++++ b/src/graphics/vulkan/pipeline_cache.cpp
+@@ -63,6 +63,10 @@ REXCVAR_DEFINE_INT32(vulkan_pipeline_live_limit, 0, "GPU/Vulkan",
+                      "which take about 24 MB of scratch GPU memory each on Adreno) alive, "
+                      "destroying the least recently used ones (recreated when needed again). "
+                      "Other pipelines are not limited. 0 = no limit");
++REXCVAR_DEFINE_INT32(vulkan_pipeline_evict_min_idle, 1800, "GPU/Vulkan",
++                     "Pipelines used within this many submissions (about 15 s of gameplay at "
++                     "~120 submissions per second) are never evicted by "
++                     "vulkan_pipeline_live_limit");
+ REXCVAR_DEFINE_INT32(vulkan_pipeline_preload_limit, -1, "GPU/Vulkan",
+                      "Create at most this many heavy pipelines (see vulkan_pipeline_live_limit) from "
+                      "the pipeline storage at startup (the rest are created when first needed; "
+@@ -854,8 +858,11 @@ void VulkanPipelineCache::EvictPipelinesOverLimit() {
+       continue;
+     }
+     uint64_t last_used = pipeline_pair.second.last_used_submission.load(std::memory_order_relaxed);
+-    // Only pipelines the GPU is surely done with.
+-    if (last_used < completed_submission) {
++    // Only pipelines the GPU is surely done with, and that haven't been used
++    // recently (evicting the current working set would only cause stutter -
++    // better to go over the limit for a while).
++    uint64_t min_idle = uint64_t(std::max(REXCVAR_GET(vulkan_pipeline_evict_min_idle), 0));
++    if (last_used < completed_submission && last_used + min_idle < completed_submission) {
+       candidates.emplace_back(last_used, &pipeline_pair);
+     }
+   }
+-- 
+2.43.0
+

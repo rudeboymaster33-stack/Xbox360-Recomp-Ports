@@ -1,0 +1,89 @@
+From 4cb9e726b4d434d1b90215e31a66a0681200cc6a Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 23 Oct 2026 22:41:34 -0400
+Subject: [PATCH] Water diagnostics: log memexport streams and index buffer
+ state, vulkan_debug_adaptive_tess_factor override
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01JJM25S15YdvewrFFwP8g6Z
+---
+ src/graphics/vulkan/command_processor.cpp | 27 +++++++++++++++++++++++
+ src/graphics/vulkan/pipeline_cache.cpp    | 10 +++++++++
+ 2 files changed, 37 insertions(+)
+
+diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
+index 4b4a49f..55734b5 100644
+--- a/src/graphics/vulkan/command_processor.cpp
++++ b/src/graphics/vulkan/command_processor.cpp
+@@ -4812,6 +4812,33 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+                                         f.dword_5);
+         }
+       }
++      for (const VulkanShader* export_shader : {vertex_shader, pixel_shader}) {
++        if (!export_shader || !export_shader->memexport_eM_written()) {
++          continue;
++        }
++        uint32_t constants_base = export_shader->type() == xenos::ShaderType::kVertex
++                                      ? regs.Get<reg::SQ_VS_CONST>().base
++                                      : regs.Get<reg::SQ_PS_CONST>().base;
++        for (uint32_t constant_index : export_shader->memexport_stream_constants()) {
++          xenos::xe_gpu_memexport_stream_t stream =
++              regs.GetMemExportStream(constants_base + constant_index);
++          bad_fetch_text += fmt::format(
++              " export_c{}=(base={:08X} format={} num_format={} endian={} count={} "
++              "raw={:08X} {:08X} {:08X} {:08X})",
++              constant_index, uint32_t(stream.base_address) << 2, uint32_t(stream.format),
++              uint32_t(stream.num_format), uint32_t(stream.endianness),
++              uint32_t(stream.index_count), stream.dword_0, stream.dword_1, stream.dword_2,
++              stream.dword_3);
++        }
++      }
++      bad_fetch_text += fmt::format(
++          " dma_base={:08X} dma_size={:08X} draw_initiator={:08X} min_idx={:08X} "
++          "max_idx={:08X} idx_offset={:08X} ib_type={} host_ib_format={} shader_ib_endian={}",
++          regs[XE_GPU_REG_VGT_DMA_BASE], regs[XE_GPU_REG_VGT_DMA_SIZE],
++          regs[XE_GPU_REG_VGT_DRAW_INITIATOR], regs[XE_GPU_REG_VGT_MIN_VTX_INDX],
++          regs[XE_GPU_REG_VGT_MAX_VTX_INDX], regs[XE_GPU_REG_VGT_INDX_OFFSET],
++          uint32_t(pr.index_buffer_type), uint32_t(pr.host_index_format),
++          uint32_t(pr.host_shader_index_endian));
+       const Shader::ConstantRegisterMap& special_vs_map = vertex_shader->constant_register_map();
+       for (uint32_t i = 0; i < 96; ++i) {
+         if (special_vs_map.vertex_fetch_bitmap[i >> 5] & (1u << (i & 31))) {
+diff --git a/src/graphics/vulkan/pipeline_cache.cpp b/src/graphics/vulkan/pipeline_cache.cpp
+index 3575d20..7dd7ffe 100644
+--- a/src/graphics/vulkan/pipeline_cache.cpp
++++ b/src/graphics/vulkan/pipeline_cache.cpp
+@@ -79,6 +79,9 @@ REXCVAR_DEFINE_BOOL(vulkan_pipeline_cache_file, true, "GPU/Vulkan",
+ REXCVAR_DEFINE_BOOL(vulkan_debug_pipeline_memory, false, "GPU/Vulkan",
+                     "Diagnostic: log how much GPU memory (Adreno kgsl) each pipeline creation "
+                     "takes, with shader details (creations are serialized while enabled)");
++REXCVAR_DEFINE_DOUBLE(vulkan_debug_adaptive_tess_factor, 0.0, "GPU/Vulkan",
++                      "Diagnostic: if above 0, adaptive tessellation ignores the guest's edge "
++                      "factors and uses this one");
+ REXCVAR_DEFINE_BOOL(vulkan_tessellation_wireframe, false, "GPU/Vulkan",
+                     "Render tessellation as wireframe")
+     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+@@ -172,6 +175,10 @@ void main() {
+ std::string GetTessellationAdaptiveVertexShaderGlsl() {
+   std::string source;
+   source += "#version 450\n";
++  if (REXCVAR_GET(vulkan_debug_adaptive_tess_factor) > 0.0) {
++    source += fmt::format("#define XE_DEBUG_ADAPTIVE_FACTOR {:.6f}\n",
++                          REXCVAR_GET(vulkan_debug_adaptive_tess_factor));
++  }
+   source += GetTessellationSystemConstantsBlockGlsl();
+   source += R"(
+ layout(location = 0) out float xe_out_value;
+@@ -198,6 +205,9 @@ void main() {
+   // tessellation through the index buffer - reinterpret the bits, don't
+   // convert the integer.
+   float tessellation_factor = uintBitsToFloat(value) + 1.0;
++#ifdef XE_DEBUG_ADAPTIVE_FACTOR
++  tessellation_factor = XE_DEBUG_ADAPTIVE_FACTOR;
++#endif
+   tessellation_factor = max(
+       tessellation_factor, xe_system_cbuffer.xe_tessellation_factor_range_min);
+   tessellation_factor = min(
+-- 
+2.43.0
+

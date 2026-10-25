@@ -5,7 +5,7 @@ set PATH=C:\Program Files\CMake\bin;C:\Program Files\Git\cmd;%LOCALAPPDATA%\Micr
 REM Android build tools: this project's own copy if there is one, otherwise the ones
 REM already installed for the Universe at War project (same tools, saves several GB).
 set "AT=%ROOT%android-tools"
-if not exist "%AT%\sdk\ndk" set "AT=%ROOT%..\UAW-Recomp\android-tools"
+if not exist "%AT%\sdk\ndk" set "AT=%ROOT%..\UniverseAtWar\android-tools"
 set "ASDK=%AT%\sdk"
 set "NDK=%ASDK%\ndk\27.2.12479018"
 set "BT=%ASDK%\build-tools\35.0.0"
@@ -31,7 +31,7 @@ REM First time: this project's own copy of the SDK, taken from the Universe at W
 REM project (same version and patches), including its already-built tools and
 REM Android libraries, so nothing has to be built for PC.
 if exist "%SDKSRC%\CMakeLists.txt" goto :havesdk
-for %%I in ("%ROOT%..\UAW-Recomp\rexglue-sdk") do set "UAWSDK=%%~fI"
+for %%I in ("%ROOT%..\UniverseAtWar\rexglue-sdk") do set "UAWSDK=%%~fI"
 if not exist "%UAWSDK%\CMakeLists.txt" (echo ==== UAW SDK NOT FOUND: %UAWSDK% & goto :fail)
 robocopy "%UAWSDK%" "%SDKSRC%" /E /XD "%UAWSDK%\out\build" /NFL /NDL /NP
 if errorlevel 8 goto :fail
@@ -83,8 +83,15 @@ if not exist "%PROJ%\assets\waveslibdll.dll" (echo ==== GAME DLLs MISSING - run 
 if not exist "%PROJ%\assets\waves\q10.dll" (echo ==== GAME DLLs MISSING - run menu option 1 first & goto :fail)
 copy /y "%ROOT%files\halo3_manifest.toml" "%PROJ%\halo3_manifest.toml"
 cd /d "%PROJ%"
-"%HOSTREX%" codegen halo3_manifest.toml
+REM Code generation only depends on the manifest: skip it when the manifest is unchanged
+REM since the last successful run (also avoids Windows Smart App Control blocking rexglue.exe).
+set "CGSTAMP=%PROJ%\generated\codegen_manifest.stamp"
+set "CGSKIP=0"
+if exist "%CGSTAMP%" fc /b "%PROJ%\halo3_manifest.toml" "%CGSTAMP%" >nul 2>&1 && set "CGSKIP=1"
+if "%CGSKIP%"=="1" echo ==== codegen skipped (manifest unchanged)
+if "%CGSKIP%"=="0" "%HOSTREX%" codegen halo3_manifest.toml
 if errorlevel 1 goto :fail
+if "%CGSKIP%"=="0" copy /y "%PROJ%\halo3_manifest.toml" "%CGSTAMP%" >nul
 cmake -S "%PROJ%" -B "%GBUILD%" -G Ninja %TC% "-DCMAKE_C_FLAGS=%ARCHFLAGS%" "-DCMAKE_CXX_FLAGS=%ARCHFLAGS%" "-DCMAKE_PREFIX_PATH=%SDKINST%" -DCMAKE_FIND_ROOT_PATH_MODE_PACKAGE=BOTH "-Drexglue_DIR=%SDKINST%\lib\cmake\rexglue" "-DHALO3_HOST_REXGLUE=%HOSTREX%"
 if errorlevel 1 goto :fail
 echo ==== GAME BUILD

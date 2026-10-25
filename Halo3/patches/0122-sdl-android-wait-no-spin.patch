@@ -1,0 +1,18 @@
+Subject: SDL (Android): no poll sentinel in the SDL_WaitEvent loop - it woke the waiting thread itself, spinning a core
+
+diff --git a/thirdparty/sdl3/src/events/SDL_events.c b/thirdparty/sdl3/src/events/SDL_events.c
+index c909a2a..55bd844 100644
+--- a/thirdparty/sdl3/src/events/SDL_events.c
++++ b/thirdparty/sdl3/src/events/SDL_events.c
+@@ -1733,7 +1733,10 @@ bool SDL_WaitEventTimeoutNS(SDL_Event *event, Sint64 timeoutNS)
+ 
+ #ifdef SDL_PLATFORM_ANDROID
+     for (;;) {
+-        SDL_PumpEventsInternal(true);
++        // No poll sentinel here: pushing it sends a lifecycle WAKE to this very
++        // thread, so Android_PumpEvents never blocked and the wait spun at 100%
++        // of a core.
++        SDL_PumpEventsInternal(false);
+ 
+         if (SDL_PeepEvents(event, 1, SDL_GETEVENT, SDL_EVENT_FIRST, SDL_EVENT_LAST) > 0) {
+             return true;

@@ -1,0 +1,190 @@
+From 60a9dd81bb6cd077036bc5b8b1f1b10a23844b72 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 23 Oct 2026 21:43:15 -0400
+Subject: [PATCH 77/78] gpu_debug_fault_watch: log shaders drawn in frames
+ before kernel GPU page faults
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01JJM25S15YdvewrFFwP8g6Z
+---
+ .../rex/graphics/vulkan/command_processor.h   |   2 +
+ src/graphics/vulkan/command_processor.cpp     | 127 ++++++++++++++++++
+ 2 files changed, 129 insertions(+)
+
+diff --git a/include/rex/graphics/vulkan/command_processor.h b/include/rex/graphics/vulkan/command_processor.h
+index 752e9bd..ead39ad 100644
+--- a/include/rex/graphics/vulkan/command_processor.h
++++ b/include/rex/graphics/vulkan/command_processor.h
+@@ -261,6 +261,8 @@ class VulkanCommandProcessor : public CommandProcessor {
+   void ShutdownContext() override;
+ 
+   void WriteRegister(uint32_t index, uint32_t value) override;
++  void GpuFaultWatchDraw(uint64_t vs_hash, uint64_t ps_hash, uint32_t flags);
++  void GpuFaultWatchFrameEnd();
+   void WriteRegistersFromMem(uint32_t start_index, uint32_t* base, uint32_t num_registers) override;
+   bool ExecutePacketType3_EVENT_WRITE_ZPD(memory::RingBuffer* reader, uint32_t packet,
+                                           uint32_t count) override;
+diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
+index 9309ef7..42d3444 100644
+--- a/src/graphics/vulkan/command_processor.cpp
++++ b/src/graphics/vulkan/command_processor.cpp
+@@ -21,6 +21,13 @@
+ #include <tuple>
+ #include <utility>
+ #include <vector>
++#include <unordered_map>
++#include <unordered_set>
++#include <deque>
++#if defined(__linux__) || defined(__ANDROID__)
++#include <fcntl.h>
++#include <unistd.h>
++#endif
+ 
+ #include <SPIRV/GlslangToSpv.h>
+ #include <glslang/Public/ShaderLang.h>
+@@ -102,6 +109,9 @@ REXCVAR_DEFINE_INT32(gpu_debug_draw_cost, 0, "GPU",
+                      "Diagnostic only (breaks visuals): 1 = 1x1 scissor on every draw, "
+                      "2 = skip every guest draw, 3 = 1x1 scissor and at most 3 vertices "
+                      "per draw (keeps only the fixed per-draw cost)");
++REXCVAR_DEFINE_BOOL(gpu_debug_fault_watch, false, "GPU",
++                    "Diagnostic (Android): watch the kernel log for GPU page faults and log which "
++                    "shader pairs were drawn in the frames right before them ([gpu-fault])");
+ REXCVAR_DEFINE_BOOL(gpu_frame_trace, true, "GPU",
+                     "With vulkan_gpu_timestamps, also write the detailed [gpu-dt] trace of one "
+                     "frame every 120 frames (very verbose)");
+@@ -2370,8 +2380,113 @@ GpuFrameStats& GetGpuFrameStats() {
+   return stats;
+ }
+ 
++namespace {
++// gpu_debug_fault_watch state (single command processor).
++struct GpuFaultWatch {
++  int kmsg_fd = -2;
++  std::unordered_set<uint64_t> frame_keys;
++  std::deque<std::unordered_set<uint64_t>> recent_frames;
++  std::unordered_map<uint64_t, uint64_t> used_frames;
++  std::unordered_map<uint64_t, uint64_t> fault_frames;
++  std::unordered_map<uint64_t, std::pair<uint64_t, uint64_t>> key_shaders;
++  uint64_t frames = 0;
++  uint64_t faults = 0;
++  uint64_t fault_events = 0;
++};
++GpuFaultWatch g_fault_watch;
++
++uint32_t GpuFaultWatchReadFaults() {
++#if defined(__linux__) || defined(__ANDROID__)
++  if (g_fault_watch.kmsg_fd == -2) {
++    g_fault_watch.kmsg_fd = open("/dev/kmsg", O_RDONLY | O_NONBLOCK | O_CLOEXEC);
++    if (g_fault_watch.kmsg_fd >= 0) {
++      lseek(g_fault_watch.kmsg_fd, 0, SEEK_END);
++    }
++    REXGPU_INFO("[gpu-fault] watching the kernel log: {}",
++                g_fault_watch.kmsg_fd >= 0 ? "ok" : "can't open /dev/kmsg");
++  }
++  if (g_fault_watch.kmsg_fd < 0) {
++    return 0;
++  }
++  uint32_t count = 0;
++  char record[2048];
++  for (int i = 0; i < 4096; ++i) {
++    ssize_t n = read(g_fault_watch.kmsg_fd, record, sizeof(record) - 1);
++    if (n <= 0) {
++      if (n < 0 && errno == EPIPE) {
++        // Overwritten records - keep reading.
++        continue;
++      }
++      break;
++    }
++    record[n] = 0;
++    if (std::strstr(record, "GPU PAGE FAULT")) {
++      ++count;
++    }
++  }
++  return count;
++#else
++  return 0;
++#endif
++}
++}  // namespace
++
++void VulkanCommandProcessor::GpuFaultWatchDraw(uint64_t vs_hash, uint64_t ps_hash,
++                                               uint32_t flags) {
++  uint64_t key = (vs_hash * 0x9E3779B97F4A7C15ull) ^ ps_hash ^ (uint64_t(flags) << 60);
++  if (g_fault_watch.frame_keys.insert(key).second) {
++    g_fault_watch.key_shaders.emplace(key, std::make_pair(vs_hash, ps_hash));
++  }
++}
++
++void VulkanCommandProcessor::GpuFaultWatchFrameEnd() {
++  GpuFaultWatch& w = g_fault_watch;
++  ++w.frames;
++  for (uint64_t key : w.frame_keys) {
++    ++w.used_frames[key];
++  }
++  w.recent_frames.push_back(std::move(w.frame_keys));
++  w.frame_keys = {};
++  while (w.recent_frames.size() > 4) {
++    w.recent_frames.pop_front();
++  }
++  uint32_t new_faults = GpuFaultWatchReadFaults();
++  if (new_faults) {
++    w.faults += new_faults;
++    ++w.fault_events;
++    std::unordered_set<uint64_t> suspects;
++    for (const auto& frame : w.recent_frames) {
++      suspects.insert(frame.begin(), frame.end());
++    }
++    for (uint64_t key : suspects) {
++      ++w.fault_frames[key];
++    }
++  }
++  if (w.frames % 300 == 0 && w.fault_events) {
++    std::vector<std::pair<double, uint64_t>> ranking;
++    for (const auto& [key, fault_count] : w.fault_frames) {
++      uint64_t used = std::max<uint64_t>(w.used_frames[key], 1);
++      // Shaders drawn mostly right before faults score high.
++      ranking.emplace_back(double(fault_count) / double(used) * double(fault_count), key);
++    }
++    std::sort(ranking.begin(), ranking.end(), std::greater<>());
++    REXGPU_INFO("[gpu-fault] {} faults in {} events over {} frames; top suspects:", w.faults,
++                w.fault_events, w.frames);
++    for (size_t i = 0; i < std::min<size_t>(ranking.size(), 12); ++i) {
++      uint64_t key = ranking[i].second;
++      auto shaders = w.key_shaders[key];
++      REXGPU_INFO("[gpu-fault]   vs={:016X} ps={:016X} flags={:X} near_faults={} used_frames={}",
++                  shaders.first, shaders.second, uint32_t(key >> 60), w.fault_frames[key],
++                  w.used_frames[key]);
++    }
++  }
++}
++
+ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
+                                        uint32_t frontbuffer_height) {
++  if (REXCVAR_GET(gpu_debug_fault_watch)) {
++    GpuFaultWatchFrameEnd();
++  }
+   SCOPE_profile_cpu_f("gpu");
+   // Consume this swap's hint first, so every swap packet consumes exactly one.
+   const bool hint_present = rex::graphics::swap_hints::PopHostSwapPresent();
+@@ -4650,6 +4765,18 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+                                           pipeline, pipeline_layout_provider, &pipeline_handle)) {
+     return draw_fail("configure_pipeline");
+   }
++  if (REXCVAR_GET(gpu_debug_fault_watch)) {
++    uint32_t fault_watch_flags = 0;
++    if (primitive_processing_result.host_vertex_shader_type !=
++        Shader::HostVertexShaderType::kVertex) {
++      fault_watch_flags |= 1;
++    }
++    if (memexport_writes_possible) {
++      fault_watch_flags |= 2;
++    }
++    GpuFaultWatchDraw(vertex_shader->ucode_data_hash(),
++                      pixel_shader ? pixel_shader->ucode_data_hash() : 0, fault_watch_flags);
++  }
+   bool pipeline_is_placeholder = false;
+   // Reload the current handle state to observe async hot-swap completions that
+   // may happen between pipeline configuration and binding.
+-- 
+2.43.0
+

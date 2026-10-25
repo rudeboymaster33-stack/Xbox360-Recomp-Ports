@@ -1,0 +1,86 @@
+From 9c8160c65029281a7422b88d86dd8c675228b9f1 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 24 Oct 2026 16:32:30 -0400
+Subject: [PATCH] Input: pump SDL events at most every input_pump_interval_ms
+ (16), Android HIDAPI scanning off by default, trace marker for the pump
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01JJM25S15YdvewrFFwP8g6Z
+---
+ src/input/sdl/sdl_input_driver.cpp | 20 ++++++++++++++++++--
+ 1 file changed, 18 insertions(+), 2 deletions(-)
+
+diff --git a/src/input/sdl/sdl_input_driver.cpp b/src/input/sdl/sdl_input_driver.cpp
+index f672740..de23a6a 100644
+--- a/src/input/sdl/sdl_input_driver.cpp
++++ b/src/input/sdl/sdl_input_driver.cpp
+@@ -9,12 +9,15 @@
+  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
+  */
+ 
++#include <algorithm>
+ #include <atomic>
+ #include <chrono>
+ #include <array>
+ #include <filesystem>
+ 
+ #include <rex/assert.h>
++#include <rex/trace_marker.h>
++#include <rex/platform.h>
+ #include <rex/chrono/clock.h>
+ #include <rex/cvar.h>
+ #include <rex/input/flags.h>
+@@ -22,6 +25,12 @@
+ #include <rex/logging.h>
+ #include <rex/ui/virtual_key.h>
+ 
++REXCVAR_DEFINE_INT32(input_pump_interval_ms, 16, "Input",
++                     "Minimum time between SDL event pumps requested by controller polls (the "
++                     "pump runs on the UI thread, which also presents frames)");
++REXCVAR_DEFINE_BOOL(input_sdl_hidapi, false, "Input",
++                    "Android: let SDL's HIDAPI drivers scan for USB/Bluetooth controllers on "
++                    "every pump (built-in controls work without it)");
+ REXCVAR_DEFINE_STRING(hid_mappings_file, "gamecontrollerdb.txt", "Input",
+                       "Path to SDL gamecontroller mappings file");
+ 
+@@ -91,6 +100,11 @@ void SDLInputDriver::OnWindowAvailable(rex::ui::Window* window) {
+           this);
+ 
+       // Initialize game controller subsystem
++#if REX_PLATFORM_ANDROID
++      if (!REXCVAR_GET(input_sdl_hidapi)) {
++        SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI, "0");
++      }
++#endif
+       if (!SDL_InitSubSystem(SDL_INIT_GAMEPAD)) {
+         REXLOG_ERROR("SDL: Failed to init gamecontroller subsystem: {}", SDL_GetError());
+         return;
+@@ -673,14 +687,15 @@ void SDLInputDriver::UpdateXCapabilities(ControllerState& state) {
+ void SDLInputDriver::QueueControllerUpdate() {
+   // The game polls input from several threads many times per frame - pumping
+   // SDL events (joystick updates, clock reads) for each poll kept the UI thread
+-  // busy at ~60% of a core. Pump at most every 4 ms.
++  // busy at ~60% of a core and delayed presents. Pump at most every
++  // input_pump_interval_ms.
+   {
+     static std::atomic<int64_t> last_pump_ns{0};
+     int64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                          std::chrono::steady_clock::now().time_since_epoch())
+                          .count();
+     int64_t last_ns = last_pump_ns.load(std::memory_order_relaxed);
+-    if (now_ns - last_ns < 4000000 ||
++    if (now_ns - last_ns < int64_t(std::max(REXCVAR_GET(input_pump_interval_ms), 0)) * 1000000 ||
+         !last_pump_ns.compare_exchange_strong(last_ns, now_ns, std::memory_order_relaxed)) {
+       return;
+     }
+@@ -690,6 +705,7 @@ void SDLInputDriver::QueueControllerUpdate() {
+   sdl_pumpevents_queued_.compare_exchange_strong(is_queued, true);
+   if (!is_queued) {
+     attached_window_->app_context().CallInUIThread([this]() {
++      ScopedTraceMarker trace_marker("ui_input_pump");
+       SDL_PumpEvents();
+       sdl_pumpevents_queued_ = false;
+     });
+-- 
+2.43.0
+

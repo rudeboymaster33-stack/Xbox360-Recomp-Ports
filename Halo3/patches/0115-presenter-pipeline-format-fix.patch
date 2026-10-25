@@ -1,0 +1,34 @@
+From a982c09d329c9cd2307d61d26b68f73d2598e1ec Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 24 Oct 2026 16:24:01 -0400
+Subject: [PATCH] Presenter: remember the swapchain effect pipeline's format -
+ it was recreated on every paint after awaiting the previous paint's GPU
+ completion
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01JJM25S15YdvewrFFwP8g6Z
+---
+ src/ui/vulkan/vulkan_presenter.cpp | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/src/ui/vulkan/vulkan_presenter.cpp b/src/ui/vulkan/vulkan_presenter.cpp
+index 85c9cef..f14742d 100644
+--- a/src/ui/vulkan/vulkan_presenter.cpp
++++ b/src/ui/vulkan/vulkan_presenter.cpp
+@@ -1892,6 +1892,13 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
+                 swapchain_effect, paint_context_.swapchain_render_pass);
+             if (swapchain_effect_pipeline.swapchain_pipeline == VK_NULL_HANDLE) {
+               guest_output_flow.effect_count = 0;
++            } else {
++              // Remember the format, otherwise the pipeline is seen as outdated
++              // on every paint - awaiting the previous paint's GPU completion
++              // (the whole GPU queue latency) and recreating the pipeline each
++              // time, which halved the displayed frame rate when the GPU was busy.
++              swapchain_effect_pipeline.swapchain_format =
++                  paint_context_.swapchain_render_pass_format;
+             }
+           }
+         }
+-- 
+2.43.0
+

@@ -1,2 +1,0 @@
-#wait=65
---gpu_skip_transfers_before_full_clears=true

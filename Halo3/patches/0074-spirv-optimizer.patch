@@ -1,0 +1,119 @@
+From 743fc9208f23e683c3e0b249c2ee9ce6608f9e08 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 23 Oct 2026 20:50:27 -0400
+Subject: [PATCH] spirv: gpu_shader_spirv_optimize - run the SPIRV-Tools
+ optimizer on translated shaders (Android builds link SPIRV-Tools-opt)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01JJM25S15YdvewrFFwP8g6Z
+---
+ src/graphics/CMakeLists.txt                   |  4 +++
+ .../pipeline/shader/spirv_translator.cpp      | 33 +++++++++++++++++++
+ thirdparty/CMakeLists.txt                     | 18 ++++++++++
+ 3 files changed, 55 insertions(+)
+
+diff --git a/src/graphics/CMakeLists.txt b/src/graphics/CMakeLists.txt
+index 0d8f8af..379b467 100644
+--- a/src/graphics/CMakeLists.txt
++++ b/src/graphics/CMakeLists.txt
+@@ -149,6 +149,10 @@ if(REXGLUE_USE_VULKAN)
+         OSDependent
+         OGLCompiler
+     )
++    if(TARGET SPIRV-Tools-opt)
++        target_link_libraries(rexgpu-xenos PRIVATE $<BUILD_INTERFACE:SPIRV-Tools-opt>)
++        target_compile_definitions(rexgpu-xenos PRIVATE REX_HAS_SPIRV_OPT=1)
++    endif()
+ endif()
+ 
+ if(REXGLUE_USE_D3D12)
+diff --git a/src/graphics/pipeline/shader/spirv_translator.cpp b/src/graphics/pipeline/shader/spirv_translator.cpp
+index 548c872..8ad96c8 100644
+--- a/src/graphics/pipeline/shader/spirv_translator.cpp
++++ b/src/graphics/pipeline/shader/spirv_translator.cpp
+@@ -19,6 +19,9 @@
+ 
+ #include <SPIRV/GLSL.std.450.h>
+ #include <fmt/format.h>
++#if REX_HAS_SPIRV_OPT
++#include <spirv-tools/optimizer.hpp>
++#endif
+ 
+ #include <rex/assert.h>
+ #include <rex/graphics/flags.h>
+@@ -40,6 +43,9 @@ REXCVAR_DEFINE_BOOL(gpu_shader_split_registers, false, "GPU/Shader",
+                     "Keep each guest register of a shader without dynamic register addressing in "
+                     "its own variable instead of one array (some mobile drivers put such arrays in "
+                     "per-pipeline scratch memory - about 10 MB of GPU memory per pipeline on Adreno)");
++REXCVAR_DEFINE_INT32(gpu_shader_spirv_optimize, 0, "GPU/Shader",
++                     "Run the SPIRV-Tools optimizer on translated shaders (Android builds): 0 = off, "
++                     "1 = performance passes (SSA, no Function variables), 2 = size passes");
+ REXCVAR_DEFINE_INT32(vulkan_spirv_max_version, 0, "GPU/Vulkan",
+                      "Highest SPIR-V version to emit, as 10/13/14/15 (0 = highest supported)");
+ 
+@@ -1310,6 +1316,33 @@ std::vector<uint8_t> SpirvShaderTranslator::CompleteTranslation() {
+   // TODO(Triang3l): Avoid copy?
+   std::vector<unsigned int> module_uints;
+   builder_->dump(module_uints);
++#if REX_HAS_SPIRV_OPT
++  if (int32_t optimize_mode = REXCVAR_GET(gpu_shader_spirv_optimize)) {
++    spv_target_env target_env = SPV_ENV_VULKAN_1_0;
++    if (features_.spirv_version >= spv::Spv_1_5) {
++      target_env = SPV_ENV_VULKAN_1_2;
++    } else if (features_.spirv_version >= spv::Spv_1_4) {
++      target_env = SPV_ENV_VULKAN_1_1_SPIRV_1_4;
++    } else if (features_.spirv_version >= spv::Spv_1_3) {
++      target_env = SPV_ENV_VULKAN_1_1;
++    }
++    spvtools::Optimizer optimizer(target_env);
++    optimizer.SetMessageConsumer(
++        [](spv_message_level_t, const char*, const spv_position_t&, const char*) {});
++    if (optimize_mode >= 2) {
++      optimizer.RegisterSizePasses();
++    } else {
++      optimizer.RegisterPerformancePasses();
++    }
++    spvtools::OptimizerOptions optimizer_options;
++    optimizer_options.set_run_validator(false);
++    std::vector<uint32_t> optimized;
++    if (optimizer.Run(module_uints.data(), module_uints.size(), &optimized, optimizer_options) &&
++        !optimized.empty()) {
++      module_uints.assign(optimized.begin(), optimized.end());
++    }
++  }
++#endif
+   std::vector<uint8_t> module_bytes;
+   module_bytes.reserve(sizeof(unsigned int) * module_uints.size());
+   module_bytes.insert(module_bytes.cend(), reinterpret_cast<const uint8_t*>(module_uints.data()),
+diff --git a/thirdparty/CMakeLists.txt b/thirdparty/CMakeLists.txt
+index 4750b8b..d602523 100644
+--- a/thirdparty/CMakeLists.txt
++++ b/thirdparty/CMakeLists.txt
+@@ -326,6 +326,24 @@ if(REXGLUE_USE_VULKAN)
+     set(SPIRV_HEADERS_ENABLE_INSTALL OFF CACHE BOOL "" FORCE)
+     add_subdirectory(spirv-headers)
+ 
++    # SPIRV-Tools optimizer (Android): run on translated shaders so mobile
++    # drivers get SSA code without Function-storage variables.
++    if(ANDROID)
++        set(SPIRV-Headers_SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/spirv-headers)
++        set(SPIRV_SKIP_TESTS ON CACHE BOOL "" FORCE)
++        set(SPIRV_SKIP_EXECUTABLES ON CACHE BOOL "" FORCE)
++        set(SPIRV_WERROR OFF CACHE BOOL "" FORCE)
++        set(SKIP_SPIRV_TOOLS_INSTALL ON CACHE BOOL "" FORCE)
++        set(SPIRV_BUILD_FUZZER OFF CACHE BOOL "" FORCE)
++        add_subdirectory(spirv-tools EXCLUDE_FROM_ALL)
++        # No debug info for these (they would add ~130 MB to the plugin).
++        foreach(spvt_target SPIRV-Tools-static SPIRV-Tools-opt)
++            if(TARGET ${spvt_target})
++                target_compile_options(${spvt_target} PRIVATE -g0)
++            endif()
++        endforeach()
++    endif()
++
+     add_library(spirv-tools-headers INTERFACE)
+     target_include_directories(spirv-tools-headers SYSTEM INTERFACE
+         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/spirv-tools/include>
+-- 
+2.43.0
+

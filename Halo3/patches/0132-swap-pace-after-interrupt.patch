@@ -1,0 +1,47 @@
+From d3de492781e252c100ab06df59d6100d1831ecf5 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 24 Oct 2026 20:25:53 -0400
+Subject: [PATCH] Swap pacing: release the held guest after the vblank
+ interrupt callback has run
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01JJM25S15YdvewrFFwP8g6Z
+---
+ src/graphics/graphics_system.cpp | 14 +++++++++-----
+ 1 file changed, 9 insertions(+), 5 deletions(-)
+
+diff --git a/src/graphics/graphics_system.cpp b/src/graphics/graphics_system.cpp
+index 2b4dc08..f7ad131 100644
+--- a/src/graphics/graphics_system.cpp
++++ b/src/graphics/graphics_system.cpp
+@@ -443,11 +443,6 @@ void GraphicsSystem::PaceGuestSwap() {
+ 
+ void GraphicsSystem::MarkVblank() {
+   TraceInstant("vblank");
+-  {
+-    std::lock_guard<std::mutex> lock(vblank_pace_mutex_);
+-    ++vblank_pace_count_;
+-  }
+-  vblank_pace_cv_.notify_all();
+   // TODO: Enable profiling once ported
+   // SCOPE_profile_cpu_f("gpu");
+ 
+@@ -460,6 +455,15 @@ void GraphicsSystem::MarkVblank() {
+   //     something wrong and the CP will block waiting for code that
+   //     needs to be run in the interrupt.
+   DispatchInterruptCallback(0, 2);
++
++  // Release a guest held in VdSwap only after the game's own vblank handler
++  // has run, so the frame it starts always sees this vblank already counted
++  // (releasing first raced the handler: the next frame saw N or N+1).
++  {
++    std::lock_guard<std::mutex> lock(vblank_pace_mutex_);
++    ++vblank_pace_count_;
++  }
++  vblank_pace_cv_.notify_all();
+ }
+ 
+ void GraphicsSystem::ClearCaches() {
+-- 
+2.43.0
+

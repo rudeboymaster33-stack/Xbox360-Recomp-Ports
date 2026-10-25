@@ -1,0 +1,269 @@
+From ea459acbf1f964168bd2192d886108b9c72b990f Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 24 Oct 2026 17:21:16 -0400
+Subject: [PATCH] Multi-object waits: per-object waiter registration (no global
+ wake storms); Android: guest thread priorities as nice values
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01JJM25S15YdvewrFFwP8g6Z
+---
+ src/core/threading_posix.cpp | 101 +++++++++++++++++++++++++----------
+ src/system/xthread.cpp       |  17 ++++++
+ 2 files changed, 89 insertions(+), 29 deletions(-)
+
+diff --git a/src/core/threading_posix.cpp b/src/core/threading_posix.cpp
+index 112ba75..61c62a1 100644
+--- a/src/core/threading_posix.cpp
++++ b/src/core/threading_posix.cpp
+@@ -21,6 +21,8 @@ static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only")
+ #include <deque>
+ #include <limits>
+ #include <memory>
++#include <vector>
++#include <algorithm>
+ 
+ #include <pthread.h>
+ #include <semaphore.h>
+@@ -31,6 +33,7 @@ static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only")
+ #include <fcntl.h>
+ #endif
+ #include <sys/syscall.h>
++#include <sys/resource.h>
+ #include <sys/time.h>
+ #include <sys/types.h>
+ #include <unistd.h>
+@@ -63,6 +66,9 @@ static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only")
+ #define REX_HAS_SIGEV_THREAD_ID 0
+ #endif
+ 
++REXCVAR_DEFINE_BOOL(android_thread_priority_nice, true, "Kernel",
++                    "Android: apply guest thread priorities as nice values (real-time "
++                    "scheduling isn't allowed for apps)");
+ REXCVAR_DEFINE_BOOL(thread_multi_wait_notify, true, "Kernel",
+                     "Waits on several objects at once sleep until one is signaled (woken "
+                     "right away) instead of checking every 1 ms - each guest thread handoff "
+@@ -305,20 +311,23 @@ class PosixConditionBase {
+   virtual ~PosixConditionBase() = default;
+   virtual bool Signal() = 0;
+ 
+-  // Wakes multi-object waiters after any object's state changed to possibly
+-  // signaled. The generation is read before checking the objects, so a change
+-  // between the check and the wait is never missed.
+-  static void NotifyMultiWaiters() {
+-    multi_generation_.fetch_add(1, std::memory_order_seq_cst);
+-    if (multi_waiters_.load(std::memory_order_seq_cst)) {
+-      std::lock_guard<std::mutex> lock(multi_mutex_);
+-      multi_cv_.notify_all();
++  // A thread waiting on several objects at once registers one of these with
++  // each object; any object that may have become signaled wakes it directly.
++  struct MultiWaiter {
++    std::mutex mutex;
++    std::condition_variable cond;
++    bool woken = false;
++  };
++  // Called with mutex_ held after the object's state changed to possibly
++  // signaled.
++  void NotifyMultiWaitersLocked() {
++    for (MultiWaiter* waiter : multi_waiters_) {
++      std::lock_guard<std::mutex> waiter_lock(waiter->mutex);
++      waiter->woken = true;
++      waiter->cond.notify_one();
+     }
+   }
+-  static inline std::mutex multi_mutex_;
+-  static inline std::condition_variable multi_cv_;
+-  static inline std::atomic<uint64_t> multi_generation_{0};
+-  static inline std::atomic<int32_t> multi_waiters_{0};
++  std::vector<MultiWaiter*> multi_waiters_;
+ 
+   WaitResult Wait(std::chrono::milliseconds timeout) {
+     bool executed;
+@@ -369,18 +378,35 @@ class PosixConditionBase {
+                         : start_time + timeout;
+ 
+     const bool notify_wait = REXCVAR_GET(thread_multi_wait_notify);
++    MultiWaiter multi_waiter;
+     struct MultiWaiterRegistration {
+-      bool active;
+-      explicit MultiWaiterRegistration(bool a) : active(a) {
+-        if (active) multi_waiters_.fetch_add(1, std::memory_order_seq_cst);
++      std::vector<PosixConditionBase*>& handles;
++      MultiWaiter* waiter;
++      MultiWaiterRegistration(std::vector<PosixConditionBase*>& h, MultiWaiter* w)
++          : handles(h), waiter(w) {
++        if (!waiter) return;
++        for (PosixConditionBase* handle : handles) {
++          std::lock_guard<std::mutex> lock(handle->mutex_);
++          handle->multi_waiters_.push_back(waiter);
++        }
+       }
+       ~MultiWaiterRegistration() {
+-        if (active) multi_waiters_.fetch_sub(1, std::memory_order_seq_cst);
++        if (!waiter) return;
++        for (PosixConditionBase* handle : handles) {
++          std::lock_guard<std::mutex> lock(handle->mutex_);
++          auto& list = handle->multi_waiters_;
++          auto it = std::find(list.begin(), list.end(), waiter);
++          if (it != list.end()) list.erase(it);
++        }
+       }
+-    } multi_waiter_registration(notify_wait);
++    } multi_waiter_registration(handles, notify_wait ? &multi_waiter : nullptr);
+ 
+     while (true) {
+-      const uint64_t observed_generation = multi_generation_.load(std::memory_order_seq_cst);
++      if (notify_wait) {
++        // Cleared before checking, so a signal after the check isn't missed.
++        std::lock_guard<std::mutex> waiter_lock(multi_waiter.mutex);
++        multi_waiter.woken = false;
++      }
+       size_t first_signaled = std::numeric_limits<size_t>::max();
+       bool condition_met = false;
+       bool all_locked = true;
+@@ -464,10 +490,9 @@ class PosixConditionBase {
+         if (end_time < wake_time) {
+           wake_time = end_time;
+         }
+-        std::unique_lock<std::mutex> multi_lock(multi_mutex_);
+-        multi_cv_.wait_until(multi_lock, wake_time, [observed_generation] {
+-          return multi_generation_.load(std::memory_order_seq_cst) != observed_generation;
+-        });
++        std::unique_lock<std::mutex> waiter_lock(multi_waiter.mutex);
++        multi_waiter.cond.wait_until(waiter_lock, wake_time,
++                                     [&multi_waiter] { return multi_waiter.woken; });
+       } else if (timeout == std::chrono::milliseconds::max()) {
+         std::this_thread::sleep_for(std::chrono::milliseconds(1));
+       } else {
+@@ -510,7 +535,7 @@ class PosixCondition<Event> : public PosixConditionBase {
+     auto lock = std::unique_lock<std::mutex>(mutex_);
+     signal_ = true;
+     cond_.notify_all();
+-    PosixConditionBase::NotifyMultiWaiters();
++    NotifyMultiWaitersLocked();
+     return true;
+   }
+ 
+@@ -548,7 +573,7 @@ class PosixCondition<Semaphore> : public PosixConditionBase {
+     }
+     count_ += release_count;
+     cond_.notify_all();
+-    PosixConditionBase::NotifyMultiWaiters();
++    NotifyMultiWaitersLocked();
+     return true;
+   }
+ 
+@@ -557,7 +582,6 @@ class PosixCondition<Semaphore> : public PosixConditionBase {
+   inline void post_execution() override {
+     count_--;
+     cond_.notify_all();
+-    PosixConditionBase::NotifyMultiWaiters();
+   }
+   uint32_t count_;
+   const uint32_t maximum_count_;
+@@ -582,7 +606,7 @@ class PosixCondition<Mutant> : public PosixConditionBase {
+       // Free to be acquired by another thread
+       if (count_ == 0) {
+         cond_.notify_all();
+-        PosixConditionBase::NotifyMultiWaiters();
++        NotifyMultiWaitersLocked();
+       }
+       return true;
+     }
+@@ -615,7 +639,7 @@ class PosixCondition<Timer> : public PosixConditionBase {
+     std::lock_guard<std::mutex> lock(mutex_);
+     signal_ = true;
+     cond_.notify_all();
+-    PosixConditionBase::NotifyMultiWaiters();
++    NotifyMultiWaitersLocked();
+     return true;
+   }
+ 
+@@ -901,6 +925,25 @@ class PosixCondition<Thread> : public PosixConditionBase {
+     sched_param param{};
+     param.sched_priority = new_priority;
+     int result = pthread_setschedparam(thread_, SCHED_FIFO, &param);
++#if REX_PLATFORM_ANDROID
++    if (result == EPERM && REXCVAR_GET(android_thread_priority_nice)) {
++      // Apps can't use real-time scheduling - map the priority to a nice value
++      // instead (game threads otherwise all run at the same priority, so a
++      // time-critical audio thread waits behind everything else).
++      // Values below kBelowNormal (8) also come from thread creation (0/1) -
++      // keep the default for those.
++      int nice_value = -4;
++      if (new_priority >= 32) {
++        nice_value = -10;
++      } else if (new_priority >= 24) {
++        nice_value = -8;
++      } else if (new_priority >= 8 && new_priority < 16) {
++        nice_value = 0;
++      }
++      setpriority(PRIO_PROCESS, pthread_gettid_np(thread_), nice_value);
++      return;
++    }
++#endif
+     if (result != 0) {
+       switch (result) {
+         case EPERM:
+@@ -1044,7 +1087,7 @@ class PosixCondition<Thread> : public PosixConditionBase {
+       exit_code_ = exit_code;
+       signaled_ = true;
+       cond_.notify_all();
+-      PosixConditionBase::NotifyMultiWaiters();
++      NotifyMultiWaitersLocked();
+     }
+     if (is_current_thread) {
+       pthread_exit(reinterpret_cast<void*>(exit_code));
+@@ -1569,7 +1612,7 @@ void* PosixCondition<Thread>::ThreadStartRoutine(void* parameter) {
+     thread->handle_.exit_code_ = 0;
+     thread->handle_.signaled_ = true;
+     thread->handle_.cond_.notify_all();
+-    PosixConditionBase::NotifyMultiWaiters();
++    thread->handle_.NotifyMultiWaitersLocked();
+   }
+ 
+   current_thread_ = nullptr;
+diff --git a/src/system/xthread.cpp b/src/system/xthread.cpp
+index cbc57e6..708d08c 100644
+--- a/src/system/xthread.cpp
++++ b/src/system/xthread.cpp
+@@ -15,6 +15,7 @@
+ 
+ #include <fmt/format.h>
+ 
++#include <rex/platform.h>
+ #include <rex/trace_marker.h>
+ #include <rex/chrono/clock.h>
+ #include <rex/cvar.h>
+@@ -849,6 +850,21 @@ void XThread::SetPriority(int32_t increment) {
+   kthread->priority = static_cast<uint8_t>(std::clamp(increment, 0, 31));
+ 
+   int32_t target_priority = 0;
++#if REX_PLATFORM_ANDROID
++  // Guest priority increments are usually small (+-1, +-2) or +-15 (time
++  // critical / idle) - map those to distinct host levels.
++  if (increment >= 15) {
++    target_priority = rex::thread::ThreadPriority::kHighest;
++  } else if (increment > 0) {
++    target_priority = rex::thread::ThreadPriority::kAboveNormal;
++  } else if (increment <= -15) {
++    target_priority = rex::thread::ThreadPriority::kLowest;
++  } else if (increment < 0) {
++    target_priority = rex::thread::ThreadPriority::kBelowNormal;
++  } else {
++    target_priority = rex::thread::ThreadPriority::kNormal;
++  }
++#else
+   if (increment > 0x22) {
+     target_priority = rex::thread::ThreadPriority::kHighest;
+   } else if (increment > 0x11) {
+@@ -860,6 +876,7 @@ void XThread::SetPriority(int32_t increment) {
+   } else {
+     target_priority = rex::thread::ThreadPriority::kNormal;
+   }
++#endif
+   if (!REXCVAR_GET(ignore_thread_priorities)) {
+     thread_->set_priority(target_priority);
+   }
+-- 
+2.43.0
+

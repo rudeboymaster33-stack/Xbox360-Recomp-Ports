@@ -1,0 +1,109 @@
+From 58c20f9f6d1ef64c755388aae053da24a3cfe5ce Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 24 Oct 2026 17:09:16 -0400
+Subject: [PATCH] [audio-late] diagnostics: slow guest audio callbacks and XMA
+ decode passes
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01JJM25S15YdvewrFFwP8g6Z
+---
+ src/audio/audio_system.cpp | 31 +++++++++++++++++++++++++++++++
+ src/audio/xma_decoder.cpp  | 15 +++++++++++++++
+ 2 files changed, 46 insertions(+)
+
+diff --git a/src/audio/audio_system.cpp b/src/audio/audio_system.cpp
+index 3b52f35..81d458a 100644
+--- a/src/audio/audio_system.cpp
++++ b/src/audio/audio_system.cpp
+@@ -26,6 +26,8 @@
+ #include <rex/system/thread_state.h>
+ #include <rex/thread.h>
+ #include <rex/cvar.h>
++#include <chrono>
++#include <algorithm>
+ 
+ REXCVAR_DEFINE_INT32(
+     audio_maxqframes, 8, "Audio",
+@@ -153,8 +155,37 @@ void AudioSystem::WorkerThreadMain() {
+         }
+         SCOPE_profile_cpu_i("apu", "rex::audio::AudioSystem->client_callback");
+         uint64_t args[] = {client_callback_arg};
++        auto callback_start = std::chrono::steady_clock::now();
+         function_dispatcher_->Execute(worker_thread_->thread_state(), client_callback, args,
+                                       rex::countof(args));
++        {
++          // [audio-late]: guest audio callbacks that took long enough to drain
++          // the output queue (each frame is 5.33 ms).
++          double callback_ms = std::chrono::duration<double, std::milli>(
++                                   std::chrono::steady_clock::now() - callback_start)
++                                   .count();
++          static uint32_t late_logged = 0;
++          static double late_max_ms = 0.0;
++          static uint32_t late_count = 0;
++          static auto late_window_start = std::chrono::steady_clock::now();
++          if (callback_ms > 4.0) {
++            ++late_count;
++            late_max_ms = std::max(late_max_ms, callback_ms);
++            if (late_logged < 200 && callback_ms > 10.0) {
++              ++late_logged;
++              REXAPU_INFO("[audio-late] guest audio callback took {:.1f} ms", callback_ms);
++            }
++          }
++          if (std::chrono::steady_clock::now() - late_window_start > std::chrono::seconds(5)) {
++            if (late_count) {
++              REXAPU_INFO("[audio-late] last 5 s: {} callbacks over 4 ms, longest {:.1f} ms",
++                          late_count, late_max_ms);
++            }
++            late_count = 0;
++            late_max_ms = 0.0;
++            late_window_start = std::chrono::steady_clock::now();
++          }
++        }
+         if (diag_pump_count < 10) {
+           REXAPU_DEBUG("AudioWorker: callback returned for client {}", index);
+         }
+diff --git a/src/audio/xma_decoder.cpp b/src/audio/xma_decoder.cpp
+index 65bf9db..db5704c 100644
+--- a/src/audio/xma_decoder.cpp
++++ b/src/audio/xma_decoder.cpp
+@@ -10,6 +10,7 @@
+  */
+ 
+ #if !defined(_WIN32)
++#include <chrono>
+ #include <sys/resource.h>
+ #endif
+ #include <rex/audio/xma/context.h>
+@@ -148,15 +149,29 @@ void XmaDecoder::WorkerThreadMain() {
+   while (worker_running_) {
+     // Okay, let's loop through XMA contexts to find ones we need to decode!
+     bool did_work = false;
++    auto pass_start = std::chrono::steady_clock::now();
++    uint32_t contexts_worked = 0;
+     for (uint32_t n = 0; n < kContextCount && worker_running_; n++) {
+       XmaContext& context = contexts_[n];
+       bool worked = context.Work();
+       if (worked) {
+         context.SignalWorkDone();
+         PROFILE_XMA_FRAME_DECODED();
++        ++contexts_worked;
+       }
+       did_work = did_work || worked;
+     }
++    {
++      double pass_ms = std::chrono::duration<double, std::milli>(
++                           std::chrono::steady_clock::now() - pass_start)
++                           .count();
++      static uint32_t logged = 0;
++      if (pass_ms > 8.0 && logged < 200) {
++        ++logged;
++        REXAPU_INFO("[audio-late] XMA decode pass took {:.1f} ms ({} contexts)", pass_ms,
++                    contexts_worked);
++      }
++    }
+ 
+     if (paused_) {
+       pause_fence_.Signal();
+-- 
+2.43.0
+
