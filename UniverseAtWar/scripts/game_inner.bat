@@ -2,9 +2,9 @@
 set ROOT=%~dp0..\
 set PATH=C:\Program Files\LLVM\bin;C:\Program Files\CMake\bin;C:\Program Files\Git\cmd;%LOCALAPPDATA%\Microsoft\WinGet\Links;%PATH%
 set "VSDIR=C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools"
-call "%VSDIR%\VC\Auxiliary\Build\vcvars64.bat"
+call "%VSDIR%\VC\Auxiliary\Build\vcvarsarm64.bat"
 set "PATH=C:\Program Files\LLVM\bin;%PATH%"
-set "SDK=%ROOT%rexglue-sdk\out\install\win-amd64"
+set "SDK=%ROOT%rexglue-sdk\out\install\win-arm64"
 set "REX=%SDK%\bin\rexglue.exe"
 set "PROJ=%ROOT%project"
 if not exist "%PROJ%\assets" mkdir "%PROJ%\assets"
@@ -20,10 +20,10 @@ echo ==== CODEGEN
 if errorlevel 1 goto :fail
 echo ==== CODEGEN OK
 echo ==== CONFIGURE
-cmake --preset win-amd64-release -DREXSDK="%SDK%" "-DCMAKE_C_FLAGS=-march=x86-64-v3" "-DCMAKE_CXX_FLAGS=-march=x86-64-v3"
+cmake --preset win-arm64-release -DREXSDK="%SDK%"
 if errorlevel 1 goto :fail
 echo ==== BUILD
-cmake --build --preset win-amd64-release --parallel 4
+cmake --build --preset win-arm64-release --parallel 4
 if errorlevel 1 goto :fail
 echo ==== SUCCESS
 exit /b 0

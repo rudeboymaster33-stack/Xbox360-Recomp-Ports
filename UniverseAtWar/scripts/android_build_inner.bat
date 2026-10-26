@@ -12,12 +12,20 @@ set "PATH=%JAVA_HOME%\bin;%PATH%"
 set "SDKSRC=%ROOT%rexglue-sdk"
 set "SDKBUILD=%SDKSRC%\out\build\android-arm64"
 set "SDKINST=%SDKSRC%\out\install\android-arm64"
-set "HOSTREX=%SDKSRC%\out\install\win-amd64\bin\rexglue.exe"
+set "HOSTREX=%SDKSRC%\out\install\win-arm64\bin\rexglue.exe"
 set "PROJ=%ROOT%project"
 set "GBUILD=%PROJ%\out\build\android-arm64"
 set "APKW=%ROOT%out\android"
 set "TC=-DCMAKE_TOOLCHAIN_FILE=%NDK%\build\cmake\android.toolchain.cmake -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-31 -DANDROID_STL=c++_shared -DCMAKE_BUILD_TYPE=Release"
 set "ARCHFLAGS=-march=armv8.2-a+fp16+dotprod+rcpc"
+REM Native ARM64 compiler for Android when possible (falls back to Google's if it fails).
+call "%ROOT%..\UniverseAtWar\scripts\android_native_llvm.bat"
+if "%NATIVE_LLVM%"=="1" (
+  set "TC=-DCMAKE_TOOLCHAIN_FILE=%NATIVE_NDK%\build\cmake\android.toolchain.cmake -DANDROID_NDK=%NATIVE_NDK% -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-31 -DANDROID_STL=c++_shared -DCMAKE_BUILD_TYPE=Release -DCMAKE_SHARED_LINKER_FLAGS=-fuse-ld=lld -DCMAKE_EXE_LINKER_FLAGS=-fuse-ld=lld -DCMAKE_MODULE_LINKER_FLAGS=-fuse-ld=lld"
+  set "ARCHFLAGS=%ARCHFLAGS% --sysroot=%NATIVE_SYSROOT%"
+  set "SDKBUILD=%SDKBUILD%-llvm"
+  set "GBUILD=%GBUILD%-llvm"
+)
 
 if not exist "%NDK%\build\cmake\android.toolchain.cmake" (echo ==== NDK MISSING & goto :fail)
 

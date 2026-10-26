@@ -24,3 +24,5 @@ userdata/
 android-tools/
 *.apk
 *.idsig
+# Saves backed up from the Retroid (when moving to the new signing key)
+retroid_backup/
